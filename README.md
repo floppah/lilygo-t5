@@ -1,37 +1,25 @@
-# Draw Images
+# LilyGo T5 Weather Station
 
-Simple firmware for a ESP32 displaying a static image on an EPaper Screen.
+`weather.ino` is firmware for the LilyGo T5 4.7" e-paper board. It connects to
+WiFi, synchronises the clock over NTP, fetches the Met Office hourly forecast
+for a fixed location and refreshes the display with:
 
-## ESP-IDF
+- current conditions (weather icon, temperature, wind and precipitation),
+- the UTC clock and date,
+- the next six hourly forecasts,
+- a battery indicator.
 
-You need to install the `quilt` tool and execute `quilt push -a` in the current directory, which will automatically generate the `esp-idf` project file.
+Forecast data is fetched every 30 minutes while the screen updates every
+minute. WiFi is switched off between fetches. The sketch uses `ArduinoJson`
+(declared in `platformio.ini`), bundled fonts and the embedded icon data in
+`weather_icons.h`.
 
-## 关于ESP32-S3
-
-When using the `arduino` environment, the program may crash and restart frequently.
-
-This is not the case with the development environment using `esp-idf`.
-
-The reason for this occurrence has not yet been found.
-
-If you know what the problem is, please let me know.
-
-## Weather forecast firmware
-
-`weather.ino` is a complete weather display: it connects to WiFi, synchronises
-the clock over NTP, fetches the Met Office hourly forecast over HTTPS, composes
-a 960x540 greyscale canvas (current conditions, UTC clock, date and six hourly
-icons) and refreshes the e-paper display. It uses `ArduinoJson` (declared in
-`platformio.ini`) and the embedded icon data in `weather_icons.h`.
+## Credentials
 
 Before building, copy `creds.h.example` to `creds.h` and fill in your WiFi
-SSID/password and Met Office API key. `creds.h` is listed in `.gitignore` so
-your credentials are never committed.
-
-The icon header is generated from the 150x150 4-bit BMPs in `../icons`:
+SSID/password, Met Office API key and forecast location (latitude/longitude):
 
 ```sh
-python3 tools/generate_icons.py
+cp creds.h.example creds.h
 ```
 
-The clock, date, current-condition labels and forecast labels use `Ubuntu225.h`, `Ubuntu42.h`, `Ubuntu32.h` and `Ubuntu20.h` respectively, all at native size.

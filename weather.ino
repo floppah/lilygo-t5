@@ -33,9 +33,9 @@
 /* Configuration                                                       */
 /* ------------------------------------------------------------------ */
 
-static const char *API_URL =
+static const char *API_URL_TEMPLATE =
     "https://data.hub.api.metoffice.gov.uk/sitespecific/v0/point/hourly"
-    "?dataSource=BD1&latitude=51.420170&longitude=-0.325104";
+    "?dataSource=BD1&latitude=%s&longitude=%s";
 
 /* Amazon Root CA 1 -- trust anchor for data.hub.api.metoffice.gov.uk. */
 static const char *API_ROOT_CA =
@@ -194,8 +194,11 @@ static bool fetchForecast()
     WiFiClientSecure client;
     client.setCACert(API_ROOT_CA);
 
+    char apiUrl[256];
+    snprintf(apiUrl, sizeof(apiUrl), API_URL_TEMPLATE, LATITUDE, LONGITUDE);
+
     HTTPClient http;
-    http.begin(client, API_URL);
+    http.begin(client, apiUrl);
     http.addHeader("apikey", API_KEY);
 
     int status = http.GET();

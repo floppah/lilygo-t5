@@ -8,4 +8,8 @@ static const char *WIFI_PASSWORD = "your-wifi-password";
 
 static const char *API_KEY = "your-met-office-api-key";
 
+/* Location used for the Met Office forecast. */
+static const char *LATITUDE = "your-latitude";
+static const char *LONGITUDE = "your-longitude";
+
 #endif // CREDS_H
