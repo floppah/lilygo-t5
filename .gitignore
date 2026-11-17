@@ -1,0 +1,8 @@
+.pio
+.vscode
+.cache
+unused
+.DS_Store
+
+# Local credentials
+creds.h

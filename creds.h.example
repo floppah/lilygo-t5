@@ -1,0 +1,11 @@
+/* Copy this file to creds.h and fill in your own values.
+ * creds.h is gitignored and must never be committed. */
+#ifndef CREDS_H
+#define CREDS_H
+
+static const char *WIFI_SSID = "your-wifi-ssid";
+static const char *WIFI_PASSWORD = "your-wifi-password";
+
+static const char *API_KEY = "your-met-office-api-key";
+
+#endif // CREDS_H
