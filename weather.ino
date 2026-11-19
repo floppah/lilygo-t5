@@ -1,8 +1,10 @@
 /* ESP32 weather station for the LilyGo T5 4.7" e-paper display.
  *
- * The sketch connects to WiFi, fetches the Met Office hourly forecast,
- * composes a 960x540 greyscale canvas (large current conditions + clock +
- * date and six hourly icons) in the e-paper framebuffer and refreshes it.
+ * The sketch connects to WiFi, fetches the Met Office hourly forecast and
+ * reads upcoming iCloud CalDAV events, then composes a 960x540 greyscale
+ * canvas (current conditions, date, up to three calendar boxes and six
+ * hourly icons) in the e-paper framebuffer.  The panel refreshes only when
+ * the image has actually changed.
  *
  * This is the ESP32 translation of ../weather.ipynb.  The icons come from
  * ../icons and are embedded as 4-bit greyscale data in weather_icons.h
@@ -16,13 +18,13 @@
 #include <ArduinoJson.h>
 #include <algorithm>
 #include <math.h>
+#include <stdlib.h>
 #include <esp_heap_caps.h>
 #include <esp_adc_cal.h>
 #include <string.h>
 #include <time.h>
 
 #include "epd_driver.h"
-#include "Ubuntu225.h"
 #include "Ubuntu42.h"
 #include "Ubuntu20.h"
 #include "Ubuntu32.h"
@@ -67,6 +69,25 @@ static const char *API_ROOT_CA =
     "akcjMS9cmvqtmg5iUaQqqcT5NJ0hGA==\n"
     "-----END CERTIFICATE-----\n";
 
+/* DigiCert Global Root G3 -- trust anchor for caldav.icloud.com and the
+ * pNN-caldav.icloud.com partition hosts. */
+static const char *ICLOUD_ROOT_CA =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIICPzCCAcWgAwIBAgIQBVVWvPJepDU1w6QP1atFcjAKBggqhkjOPQQDAzBhMQsw\n"
+    "CQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3d3cu\n"
+    "ZGlnaWNlcnQuY29tMSAwHgYDVQQDExdEaWdpQ2VydCBHbG9iYWwgUm9vdCBHMzAe\n"
+    "Fw0xMzA4MDExMjAwMDBaFw0zODAxMTUxMjAwMDBaMGExCzAJBgNVBAYTAlVTMRUw\n"
+    "EwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20x\n"
+    "IDAeBgNVBAMTF0RpZ2lDZXJ0IEdsb2JhbCBSb290IEczMHYwEAYHKoZIzj0CAQYF\n"
+    "K4EEACIDYgAE3afZu4q4C/sLfyHS8L6+c/MzXRq8NOrexpu80JX28MzQC7phW1FG\n"
+    "fp4tn+6OYwwX7Adw9c+ELkCDnOg/QW07rdOkFFk2eJ0DQ+4QE2xy3q6Ip6FrtUPO\n"
+    "Z9wj/wMco+I+o0IwQDAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBhjAd\n"
+    "BgNVHQ4EFgQUs9tIpPmhxdiuNkHMEWNpYim8S8YwCgYIKoZIzj0EAwMDaAAwZQIx\n"
+    "AK288mw/EkrRLTnDCgmXc/SINoyIJ7vmiI1Qhadj+Z4y3maTD/HMsQmP3Wyr+mt/\n"
+    "oAIwOWZbwmSNuJ5Q3KjVSaLtx9zRSX8XAbjIho9OjIgrqJqpisXRAL34VOKa5Vt8\n"
+    "sycX\n"
+    "-----END CERTIFICATE-----\n";
+
 /* Layout: same numbers as the notebook. */
 #define CANVAS_WIDTH EPD_WIDTH
 #define CANVAS_HEIGHT EPD_HEIGHT
@@ -74,17 +95,27 @@ static const char *API_ROOT_CA =
 #define SIDE_MARGIN 20
 #define TOP_MARGIN 20
 #define BOTTOM_MARGIN 20
+/* Geometry of the large current-conditions icon, shared with the calendar
+ * boxes so their top edge and height always line up with it. */
+#define CURRENT_ICON_X ((int)(SIDE_MARGIN * 1.5))
+#define CURRENT_ICON_Y ((int)(TOP_MARGIN * 1.5) + 25)
+#define CURRENT_ICON_SIZE (ICON_SIZE * 2)
 #define FORECAST_COUNT 6
 #define MAX_FORECAST_ROWS 64
-#define REFRESH_INTERVAL_MS (60UL * 1000UL)
+#define CALENDAR_EVENT_COUNT 3
+#define CALENDAR_WINDOW_DAYS 14
+#define MAX_CALENDARS 12
+#define MAX_ICAL_EVENTS 32
+#define CALENDAR_TITLE_LEN 64
+#define CALENDAR_NOTES_LEN 160
+#define LOOP_INTERVAL_MS (5UL * 60UL * 1000UL)
 #define DATA_REFRESH_INTERVAL_MS (30UL * 60UL * 1000UL)
 
 /* The text fonts are TFT_eSPI "VLW" fonts: a header, one 28-byte metric record
  * per glyph and an 8-bit alpha bitmap per glyph.  Glyph count, ascent and
- * descent are read from each font header at runtime.  The clock, date, current
- * labels and forecast labels use Ubuntu225, Ubuntu42, Ubuntu32 and Ubuntu20 at
- * native scale (1:1), so no text is resampled. */
-#define CLOCK_FONT_BITS Ubuntu225
+ * descent are read from each font header at runtime.  The date, current labels
+ * and forecast labels use Ubuntu42, Ubuntu32 and Ubuntu20 at native scale
+ * (1:1), so no text is resampled. */
 #define DATE_FONT_BITS Ubuntu42
 #define ICON_FONT_BITS Ubuntu20
 #define CURRENT_FONT_BITS Ubuntu32
@@ -125,16 +156,31 @@ struct ForecastRow {
     float wind;                 /* windSpeed10m, m/s */
 };
 
+struct CalendarEvent {
+    time_t start;
+    time_t duration;
+    char title[CALENDAR_TITLE_LEN];
+    char notes[CALENDAR_NOTES_LEN];
+    bool allDay;
+};
+
+static const char *WEEKDAY_NAMES[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+static const char *MONTH_NAMES[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+
 static ForecastRow forecast[MAX_FORECAST_ROWS];
 static size_t forecastCount = 0;
 static uint8_t *framebuffer = nullptr;
-static Font clockFont = { CLOCK_FONT_BITS, 0, 0, 0, false };
 static Font dateFont = { DATE_FONT_BITS, 0, 0, 0, false };
 static Font iconFont = { ICON_FONT_BITS, 0, 0, 0, false };
 static Font currentFont = { CURRENT_FONT_BITS, 0, 0, 0, false };
 
 static unsigned long lastDataRefreshMs = 0;
 static bool dataRefreshDue = true;
+static uint64_t lastDisplayedHash = 0;
+static bool displayInitialized = false;
+static CalendarEvent calendarEvents[MAX_ICAL_EVENTS];
+static size_t calendarEventCount = 0;
 
 /* ------------------------------------------------------------------ */
 /* Networking / time                                                   */
@@ -170,7 +216,9 @@ static void disconnectWiFi()
 static void syncUtcTime()
 {
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-    setenv("TZ", "UTC0", 1);
+    /* time() stays UTC; TZ only affects mktime()/localtime_r() used when
+     * interpreting calendar times that carry a TZID. */
+    setenv("TZ", ICLOUD_TZ, 1);
     tzset();
 
     Serial.print("Waiting for NTP time");
@@ -274,6 +322,670 @@ static bool fetchForecast()
 
     Serial.printf("Parsed %u forecast rows\n", forecastCount);
     return forecastCount > 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* iCloud CalDAV calendar                                              */
+/* ------------------------------------------------------------------ */
+
+/* Namespace prefixes vary between servers (and iCloud uses both default
+ * namespaces and d:/c: prefixes), so strip them before doing simple tag
+ * lookups on the response XML. */
+static String xmlStripPrefixes(const String &xml)
+{
+    String out;
+    out.reserve(xml.length());
+    for (int i = 0; i < xml.length();)
+    {
+        if (xml[i] != '<')
+        {
+            out += xml[i++];
+            continue;
+        }
+        out += '<';
+        ++i;
+        if (i < xml.length() && xml[i] == '/')
+        {
+            out += '/';
+            ++i;
+        }
+        int j = i;
+        while (j < xml.length() && xml[j] != ':' && xml[j] != '>' &&
+               xml[j] != ' ' && xml[j] != '\t' && xml[j] != '\r' &&
+               xml[j] != '\n' && xml[j] != '/')
+            ++j;
+        if (j < xml.length() && xml[j] == ':')
+            i = j + 1;
+    }
+    return out;
+}
+
+static bool xmlBlock(const String &xml, const char *tag, int from,
+                     String &content, int &next)
+{
+    String open = String("<") + tag;
+    int p = xml.indexOf(open, from);
+    while (p >= 0)
+    {
+        int nameEnd = p + open.length();
+        char c = xml.charAt(nameEnd);
+        if (c == '>' || c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '/')
+        {
+            int gt = xml.indexOf('>', nameEnd);
+            if (gt < 0)
+                return false;
+            if (gt > nameEnd && xml.charAt(gt - 1) == '/')
+            {
+                content = "";
+                next = gt + 1;
+                return true;
+            }
+            String close = String("</") + tag + ">";
+            int ce = xml.indexOf(close, gt + 1);
+            if (ce < 0)
+                return false;
+            content = xml.substring(gt + 1, ce);
+            next = ce + close.length();
+            return true;
+        }
+        p = xml.indexOf(open, p + 1);
+    }
+    return false;
+}
+
+static bool xmlValue(const String &xml, const char *tag, String &value)
+{
+    String content;
+    int next = 0;
+    if (!xmlBlock(xml, tag, 0, content, next))
+        return false;
+    value = content;
+    value.trim();
+    return true;
+}
+
+static String xmlUnescape(const String &s)
+{
+    String out;
+    out.reserve(s.length());
+    for (int i = 0; i < s.length(); ++i)
+    {
+        if (s[i] != '&')
+        {
+            out += s[i];
+            continue;
+        }
+        int semi = s.indexOf(';', i);
+        if (semi < 0 || semi - i > 10)
+        {
+            out += s[i];
+            continue;
+        }
+        String ent = s.substring(i + 1, semi);
+        if (ent == "amp") out += '&';
+        else if (ent == "lt") out += '<';
+        else if (ent == "gt") out += '>';
+        else if (ent == "quot") out += '"';
+        else if (ent == "apos") out += '\'';
+        else if (ent.startsWith("#x") || ent.startsWith("#X"))
+            out += (char)strtol(ent.substring(2).c_str(), nullptr, 16);
+        else if (ent.startsWith("#"))
+            out += (char)strtol(ent.substring(1).c_str(), nullptr, 10);
+        else
+            out += s.substring(i, semi + 1);
+        i = semi;
+    }
+    return out;
+}
+
+static String calendarDataText(const String &data)
+{
+    int a = data.indexOf("<![CDATA[");
+    if (a < 0)
+        return xmlUnescape(data);
+    a += 9;
+    int b = data.indexOf("]]>", a);
+    return b < 0 ? data.substring(a) : data.substring(a, b);
+}
+
+static String resolveCalDavUrl(const String &base, const String &href)
+{
+    if (href.startsWith("http://") || href.startsWith("https://"))
+        return href;
+    int scheme = base.indexOf("://");
+    if (scheme < 0)
+        return href;
+    int hostStart = scheme + 3;
+    int slash = base.indexOf('/', hostStart);
+    String origin = slash < 0 ? base : base.substring(0, slash);
+    if (href.startsWith("/"))
+        return origin + href;
+    String path = slash < 0 ? String("/") : base.substring(slash);
+    int lastSlash = path.lastIndexOf('/');
+    return origin + path.substring(0, lastSlash + 1) + href;
+}
+
+static bool calDavRequest(const String &url, const char *method,
+                          const char *depth, const String &body,
+                          String &response)
+{
+    WiFiClientSecure client;
+    client.setCACert(ICLOUD_ROOT_CA);
+
+    HTTPClient http;
+    http.begin(client, url);
+    http.setAuthorization(ICLOUD_USERNAME, ICLOUD_APP_PASSWORD);
+    http.addHeader("Depth", depth);
+    http.addHeader("Content-Type", "application/xml; charset=utf-8");
+    http.setTimeout(20000);
+
+    int status = http.sendRequest(method, body);
+    if (status >= 200 && status < 300)
+        response = http.getString();
+    else
+        Serial.printf("CalDAV %s %s failed: HTTP %d\n", method, url.c_str(), status);
+    http.end();
+    return status >= 200 && status < 300;
+}
+
+/* Howard Hinnant's civil-date algorithm: days since 1970-01-01. */
+static long daysFromCivil(int year, int month, int day)
+{
+    year -= month <= 2;
+    int era = (year >= 0 ? year : year - 399) / 400;
+    unsigned yoe = (unsigned)(year - era * 400);
+    unsigned doy = (153 * (unsigned)(month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return (long)era * 146097 + (long)doe - 719468;
+}
+
+static time_t makeCalendarTime(int year, int month, int day,
+                               int hour, int minute, int second, bool utc)
+{
+    if (utc)
+        return daysFromCivil(year, month, day) * 86400L +
+               hour * 3600L + minute * 60L + second;
+    struct tm timeinfo = {};
+    timeinfo.tm_year = year - 1900;
+    timeinfo.tm_mon = month - 1;
+    timeinfo.tm_mday = day;
+    timeinfo.tm_hour = hour;
+    timeinfo.tm_min = minute;
+    timeinfo.tm_sec = second;
+    timeinfo.tm_isdst = -1;
+    return mktime(&timeinfo);
+}
+
+static String icsParam(const String &params, const char *name)
+{
+    int p = 0;
+    while (p < params.length())
+    {
+        int end = params.indexOf(';', p);
+        if (end < 0)
+            end = params.length();
+        String part = params.substring(p, end);
+        int eq = part.indexOf('=');
+        if (eq > 0 && part.substring(0, eq).equalsIgnoreCase(name))
+        {
+            String value = part.substring(eq + 1);
+            value.trim();
+            return value;
+        }
+        p = end + 1;
+    }
+    return String();
+}
+
+static bool parseIcsTime(const String &value, const String &params,
+                         time_t &result, bool &allDay)
+{
+    String v = value;
+    v.trim();
+    bool utc = v.endsWith("Z");
+    if (utc)
+        v.remove(v.length() - 1);
+
+    int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+    allDay = v.length() == 8 ||
+             icsParam(params, "VALUE").equalsIgnoreCase("DATE");
+    if (allDay)
+    {
+        if (sscanf(v.c_str(), "%4d%2d%2d", &year, &month, &day) != 3)
+            return false;
+    }
+    else
+    {
+        if (sscanf(v.c_str(), "%4d%2d%2dT%2d%2d%2d",
+                   &year, &month, &day, &hour, &minute, &second) < 5)
+            return false;
+    }
+    result = makeCalendarTime(year, month, day, hour, minute, second, utc);
+    return true;
+}
+
+static String icsUnescapeText(const String &s)
+{
+    String out;
+    out.reserve(s.length());
+    for (int i = 0; i < s.length(); ++i)
+    {
+        if (s[i] == '\\' && i + 1 < s.length())
+        {
+            char c = s[++i];
+            if (c == 'n' || c == 'N') out += ' ';
+            else out += c;
+        }
+        else
+        {
+            out += s[i];
+        }
+    }
+    return out;
+}
+
+static void splitIcsProperty(const String &line, String &name,
+                             String &params, String &value)
+{
+    int colon = -1;
+    bool quoted = false;
+    for (int i = 0; i < line.length(); ++i)
+    {
+        if (line[i] == '"') quoted = !quoted;
+        else if (line[i] == ':' && !quoted) { colon = i; break; }
+    }
+    if (colon < 0)
+    {
+        name = line;
+        params = "";
+        value = "";
+        return;
+    }
+    String head = line.substring(0, colon);
+    value = line.substring(colon + 1);
+    int semi = head.indexOf(';');
+    if (semi < 0)
+    {
+        name = head;
+        params = "";
+    }
+    else
+    {
+        name = head.substring(0, semi);
+        params = head.substring(semi + 1);
+    }
+}
+
+static String unfoldIcs(const String &ics)
+{
+    String out;
+    out.reserve(ics.length());
+    int start = 0;
+    while (start <= ics.length())
+    {
+        int nl = ics.indexOf('\n', start);
+        String line = nl < 0 ? ics.substring(start) : ics.substring(start, nl);
+        if (line.endsWith("\r"))
+            line.remove(line.length() - 1);
+        if (!line.isEmpty() && (line[0] == ' ' || line[0] == '\t'))
+        {
+            if (!out.isEmpty())
+                out += line.substring(1);
+        }
+        else
+        {
+            if (!out.isEmpty())
+                out += '\n';
+            out += line;
+        }
+        if (nl < 0)
+            break;
+        start = nl + 1;
+    }
+    return out;
+}
+
+static void addCalendarOccurrence(time_t start, time_t duration,
+                                  const String &title, const String &notes,
+                                  bool allDay, time_t windowStart,
+                                  time_t windowEnd, const String &exdates)
+{
+    if (start < windowStart || start >= windowEnd ||
+        calendarEventCount >= MAX_ICAL_EVENTS)
+        return;
+
+    struct tm timeinfo;
+    gmtime_r(&start, &timeinfo);
+    char stamp[16];
+    snprintf(stamp, sizeof(stamp), "%04d%02d%02dT%02d%02d%02d",
+             timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+             timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    if (exdates.indexOf(stamp) >= 0)
+        return;
+
+    for (size_t i = 0; i < calendarEventCount; ++i)
+    {
+        if (calendarEvents[i].start == start &&
+            strcmp(calendarEvents[i].title, title.c_str()) == 0)
+            return;
+    }
+
+    CalendarEvent &event = calendarEvents[calendarEventCount++];
+    event.start = start;
+    event.duration = duration;
+    event.allDay = allDay;
+    strlcpy(event.title, title.c_str(), sizeof(event.title));
+    strlcpy(event.notes, notes.c_str(), sizeof(event.notes));
+}
+
+static time_t addLocalDays(time_t t, int days)
+{
+    struct tm timeinfo;
+    localtime_r(&t, &timeinfo);
+    timeinfo.tm_mday += days;
+    timeinfo.tm_isdst = -1;
+    return mktime(&timeinfo);
+}
+
+static void addRecurringOccurrences(time_t first, time_t duration,
+                                    const String &title, const String &notes,
+                                    bool allDay, const String &rrule,
+                                    const String &exdates,
+                                    time_t windowStart, time_t windowEnd)
+{
+    int freq = 0;               /* 0 = daily, 1 = weekly */
+    int interval = 1;
+    int count = -1;
+    time_t until = 0;
+    int byDayMask = 0;
+
+    int p = 0;
+    while (p < rrule.length())
+    {
+        int end = rrule.indexOf(';', p);
+        if (end < 0)
+            end = rrule.length();
+        String part = rrule.substring(p, end);
+        int eq = part.indexOf('=');
+        if (eq > 0)
+        {
+            String key = part.substring(0, eq);
+            String value = part.substring(eq + 1);
+            if (key.equalsIgnoreCase("FREQ"))
+                freq = value.equalsIgnoreCase("WEEKLY") ? 1 : 0;
+            else if (key.equalsIgnoreCase("INTERVAL"))
+                interval = std::max(1, (int)value.toInt());
+            else if (key.equalsIgnoreCase("COUNT"))
+                count = value.toInt();
+            else if (key.equalsIgnoreCase("UNTIL"))
+            {
+                bool ignored;
+                parseIcsTime(value, "", until, ignored);
+            }
+            else if (key.equalsIgnoreCase("BYDAY"))
+            {
+                int q = 0;
+                while (q < value.length())
+                {
+                    int comma = value.indexOf(',', q);
+                    if (comma < 0) comma = value.length();
+                    String day = value.substring(q, comma);
+                    if (day.endsWith("SU")) byDayMask |= 1 << 0;
+                    else if (day.endsWith("MO")) byDayMask |= 1 << 1;
+                    else if (day.endsWith("TU")) byDayMask |= 1 << 2;
+                    else if (day.endsWith("WE")) byDayMask |= 1 << 3;
+                    else if (day.endsWith("TH")) byDayMask |= 1 << 4;
+                    else if (day.endsWith("FR")) byDayMask |= 1 << 5;
+                    else if (day.endsWith("SA")) byDayMask |= 1 << 6;
+                    q = comma + 1;
+                }
+            }
+        }
+        p = end + 1;
+    }
+
+    struct tm firstLocal;
+    localtime_r(&first, &firstLocal);
+    int firstHour = firstLocal.tm_hour;
+    int firstMinute = firstLocal.tm_min;
+    int firstSecond = firstLocal.tm_sec;
+
+    struct tm startDay;
+    localtime_r(&first, &startDay);
+    startDay.tm_hour = 0;
+    startDay.tm_min = 0;
+    startDay.tm_sec = 0;
+    startDay.tm_isdst = -1;
+    time_t day = mktime(&startDay);
+
+    int emitted = 0;
+    for (int dayIndex = 0; day < windowEnd && dayIndex < 365; ++dayIndex,
+                            day = addLocalDays(day, 1))
+    {
+        if (until && day > until)
+            break;
+        if (count >= 0 && emitted >= count)
+            break;
+
+        bool include;
+        if (freq == 1)
+        {
+            include = (dayIndex / 7) % interval == 0;
+            if (include && byDayMask)
+            {
+                struct tm tmDay;
+                localtime_r(&day, &tmDay);
+                include = (byDayMask & (1 << tmDay.tm_wday)) != 0;
+            }
+        }
+        else
+        {
+            include = dayIndex % interval == 0;
+        }
+        if (!include)
+            continue;
+
+        struct tm occurrence;
+        localtime_r(&day, &occurrence);
+        occurrence.tm_hour = firstHour;
+        occurrence.tm_min = firstMinute;
+        occurrence.tm_sec = firstSecond;
+        occurrence.tm_isdst = -1;
+        time_t start = mktime(&occurrence);
+        if (start < first || start < windowStart)
+            continue;
+        addCalendarOccurrence(start, duration, title, notes, allDay,
+                              windowStart, windowEnd, exdates);
+        ++emitted;
+    }
+}
+
+static void parseCalendarData(const String &ics,
+                              time_t windowStart, time_t windowEnd)
+{
+    String lines = unfoldIcs(ics);
+    bool inEvent = false;
+    time_t start = 0, end = 0;
+    String title, notes, rrule, exdates;
+    bool allDay = false;
+    int startPos = 0;
+
+    while (startPos <= lines.length())
+    {
+        int nl = lines.indexOf('\n', startPos);
+        String line = nl < 0 ? lines.substring(startPos) : lines.substring(startPos, nl);
+        if (line == "BEGIN:VEVENT")
+        {
+            inEvent = true;
+            start = end = 0;
+            title = notes = rrule = exdates = "";
+            allDay = false;
+        }
+        else if (line == "END:VEVENT" && inEvent)
+        {
+            inEvent = false;
+            if (start == 0 || title.isEmpty())
+                continue;
+            time_t duration = end > start ? end - start : (allDay ? 86400 : 0);
+            if (rrule.isEmpty())
+                addCalendarOccurrence(start, duration, title, notes, allDay,
+                                      windowStart, windowEnd, exdates);
+            else
+                addRecurringOccurrences(start, duration, title, notes, allDay,
+                                        rrule, exdates, windowStart, windowEnd);
+        }
+        else if (inEvent)
+        {
+            String name, params, value;
+            splitIcsProperty(line, name, params, value);
+            if (name == "DTSTART")
+                parseIcsTime(value, params, start, allDay);
+            else if (name == "DTEND")
+            {
+                bool endAllDay;
+                parseIcsTime(value, params, end, endAllDay);
+            }
+            else if (name == "SUMMARY")
+                title = icsUnescapeText(value);
+            else if (name == "DESCRIPTION")
+                notes = icsUnescapeText(value);
+            else if (name == "RRULE")
+                rrule = value;
+            else if (name == "EXDATE")
+            {
+                if (!exdates.isEmpty())
+                    exdates += ',';
+                exdates += value;
+            }
+        }
+        if (nl < 0)
+            break;
+        startPos = nl + 1;
+    }
+}
+
+static void sortCalendarEvents()
+{
+    for (size_t i = 1; i < calendarEventCount; ++i)
+    {
+        CalendarEvent item = calendarEvents[i];
+        size_t j = i;
+        while (j > 0 && calendarEvents[j - 1].start > item.start)
+        {
+            calendarEvents[j] = calendarEvents[j - 1];
+            --j;
+        }
+        calendarEvents[j] = item;
+    }
+    if (calendarEventCount > CALENDAR_EVENT_COUNT)
+        calendarEventCount = CALENDAR_EVENT_COUNT;
+}
+
+static bool fetchCalendarEvents()
+{
+    const String root = "https://caldav.icloud.com/";
+    const String principalBody =
+        "<propfind xmlns=\"DAV:\"><prop><current-user-principal/></prop></propfind>";
+    const String homeSetBody =
+        "<propfind xmlns=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">"
+        "<prop><c:calendar-home-set/></prop></propfind>";
+    const String calendarListBody =
+        "<propfind xmlns=\"DAV:\"><prop><displayname/><resourcetype/></prop></propfind>";
+
+    String response;
+    if (!calDavRequest(root, "PROPFIND", "0", principalBody, response))
+        return false;
+
+    String xml = xmlStripPrefixes(response);
+    String block, href;
+    int next = 0;
+    if (!xmlBlock(xml, "current-user-principal", 0, block, next) ||
+        !xmlValue(block, "href", href))
+    {
+        Serial.println("CalDAV: no current-user-principal in response");
+        return false;
+    }
+    String principalUrl = resolveCalDavUrl(root, href);
+
+    if (!calDavRequest(principalUrl, "PROPFIND", "0", homeSetBody, response))
+        return false;
+    xml = xmlStripPrefixes(response);
+    if (!xmlBlock(xml, "calendar-home-set", 0, block, next) ||
+        !xmlValue(block, "href", href))
+    {
+        Serial.println("CalDAV: no calendar-home-set in response");
+        return false;
+    }
+    String homeUrl = resolveCalDavUrl(principalUrl, href);
+
+    if (!calDavRequest(homeUrl, "PROPFIND", "1", calendarListBody, response))
+        return false;
+    xml = xmlStripPrefixes(response);
+
+    String calendarUrls[MAX_CALENDARS];
+    size_t calendarCount = 0;
+    int pos = 0;
+    while (xmlBlock(xml, "response", pos, block, next))
+    {
+        /* iCloud writes <calendar xmlns="urn:ietf:params:xml:ns:caldav"/>,
+         * so match the tag name rather than an exact literal string. */
+        String calendarTag;
+        int calendarNext = 0;
+        if (xmlBlock(block, "calendar", 0, calendarTag, calendarNext))
+        {
+            String calendarHref;
+            if (xmlValue(block, "href", calendarHref) &&
+                calendarCount < MAX_CALENDARS)
+                calendarUrls[calendarCount++] = resolveCalDavUrl(homeUrl, calendarHref);
+        }
+        pos = next;
+    }
+    Serial.printf("CalDAV: found %u calendars\n", calendarCount);
+
+    time_t now = time(nullptr);
+    time_t windowStart = now;
+    time_t windowEnd = now + CALENDAR_WINDOW_DAYS * 86400L;
+    struct tm timeinfo;
+    gmtime_r(&windowStart, &timeinfo);
+    char startStamp[17], endStamp[17];   /* "YYYYMMDDTHHMMSSZ" + NUL */
+    snprintf(startStamp, sizeof(startStamp), "%04d%02d%02dT%02d%02d%02dZ",
+             timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+             timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    gmtime_r(&windowEnd, &timeinfo);
+    snprintf(endStamp, sizeof(endStamp), "%04d%02d%02dT%02d%02d%02dZ",
+             timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+             timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+
+    String reportBody =
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+        "<c:calendar-query xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">"
+        "<d:prop><d:getetag/><c:calendar-data/></d:prop>"
+        "<c:filter><c:comp-filter name=\"VCALENDAR\">"
+        "<c:comp-filter name=\"VEVENT\">"
+        "<c:time-range start=\"" + String(startStamp) +
+        "\" end=\"" + String(endStamp) + "\"/>"
+        "</c:comp-filter></c:comp-filter></c:filter></c:calendar-query>";
+
+    calendarEventCount = 0;
+    for (size_t i = 0; i < calendarCount; ++i)
+    {
+        if (!calDavRequest(calendarUrls[i], "REPORT", "1", reportBody, response))
+            continue;
+        String calendarXml = xmlStripPrefixes(response);
+        int responsePos = 0;
+        while (xmlBlock(calendarXml, "response", responsePos, block, next))
+        {
+            String data;
+            int dataNext = 0;
+            if (xmlBlock(block, "calendar-data", 0, data, dataNext))
+                parseCalendarData(calendarDataText(data), windowStart, windowEnd);
+            responsePos = next;
+        }
+    }
+
+    sortCalendarEvents();
+    Serial.printf("Parsed %u upcoming calendar events\n", calendarEventCount);
+    return calendarEventCount > 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -407,10 +1119,10 @@ static void drawText(Font &font, const char *text, int x, int y, float f,
 /* Equivalent of the notebook's draw_text(): fractions of the icon box. */
 static void drawIconLabel(Font &font, const char *text, int iconX, int iconY,
                           int size, float xFraction, float yFraction,
-                          TextAlign align)
+                          TextAlign align, int yOffset = 0)
 {
     int anchorX = iconX + (int)(xFraction * size);
-    int baseline = iconY + (int)(yFraction * size);
+    int baseline = iconY + (int)(yFraction * size) + yOffset;
     /* cv2.putText uses a baseline; our font is positioned by its top edge. */
     ensureFont(font);
     int top = baseline - font.ascent;
@@ -453,7 +1165,7 @@ static void drawIcon(int code, int x, int y, int size)
 /* Battery level, adapted from the original OWM_EPD47_epaper_v2.5 sketch.
  * GPIO36 (ADC1_CH0) reads the divider on the LilyGo T5 4.7 board.  The
  * eFuse-calibrated Vref is used when available, otherwise the default 1100 mV. */
-static void drawBattery(int x, int y)
+static void drawBattery(int rightEdge, int y)
 {
     static uint32_t vref = 1100;
     esp_adc_cal_characteristics_t adcChars;
@@ -478,15 +1190,19 @@ static void drawBattery(int x, int y)
     int percentage = (int)lroundf(std::max(0.0f, std::min(100.0f, level)));
     Serial.printf("Battery: %d%%, %.2fV\n", percentage, voltage);
 
+    char text[16];
+    snprintf(text, sizeof(text), "%d%% %.1fV", percentage, voltage);
+
     const int bodyWidth = 40, bodyHeight = 16;
+    int width = bodyWidth + 4 + 9 + textWidth(iconFont, text, 1.0f);
+    int x = rightEdge - width;
+
     epd_draw_rect(x, y, bodyWidth, bodyHeight, 0, framebuffer);
     epd_fill_rect(x + bodyWidth, y + 5, 4, 6, 0, framebuffer);
     int fillWidth = (bodyWidth - 4) * percentage / 100;
     if (fillWidth > 0)
         epd_fill_rect(x + 2, y + 2, fillWidth, bodyHeight - 4, 0, framebuffer);
 
-    char text[16];
-    snprintf(text, sizeof(text), "%d%% %.1fV", percentage, voltage);
     drawText(iconFont, text, x + bodyWidth + 9, y, 1.0f, ALIGN_LEFT, 0);
 }
 
@@ -537,6 +1253,150 @@ static void selectForecast(int &currentIndex, int upcoming[FORECAST_COUNT])
 }
 
 /* ------------------------------------------------------------------ */
+/* Calendar boxes                                                      */
+/* ------------------------------------------------------------------ */
+
+static void drawRoundRect(int x, int y, int width, int height, int radius,
+                          uint8_t color)
+{
+    radius = std::min(radius, std::min(width, height) / 2);
+    for (int dy = 0; dy <= radius; ++dy)
+    {
+        int inset = radius -
+                    (int)lroundf(sqrtf((float)(radius * radius - dy * dy)));
+        epd_draw_pixel(x + inset, y + radius - dy, color, framebuffer);
+        epd_draw_pixel(x + width - 1 - inset, y + radius - dy, color, framebuffer);
+        epd_draw_pixel(x + inset, y + height - 1 - radius + dy, color, framebuffer);
+        epd_draw_pixel(x + width - 1 - inset, y + height - 1 - radius + dy,
+                       color, framebuffer);
+    }
+    for (int px = x + radius; px <= x + width - 1 - radius; ++px)
+    {
+        epd_draw_pixel(px, y, color, framebuffer);
+        epd_draw_pixel(px, y + height - 1, color, framebuffer);
+    }
+    for (int py = y + radius; py <= y + height - 1 - radius; ++py)
+    {
+        epd_draw_pixel(x, py, color, framebuffer);
+        epd_draw_pixel(x + width - 1, py, color, framebuffer);
+    }
+}
+
+static void drawTextFitted(Font &font, const char *text, int x, int y,
+                           int maxWidth, float scale, TextAlign align,
+                           uint8_t color)
+{
+    String value(text);
+    if (textWidth(font, value.c_str(), scale) <= maxWidth)
+    {
+        drawText(font, value.c_str(), x, y, scale, align, color);
+        return;
+    }
+    while (value.length() > 1 &&
+           textWidth(font, (value + "...").c_str(), scale) > maxWidth)
+        value.remove(value.length() - 1);
+    value += "...";
+    drawText(font, value.c_str(), x, y, scale, align, color);
+}
+
+/* Greedy word wrap used for calendar notes.  Up to maxLines lines are drawn;
+ * the final line gets an ellipsis if the text does not fit. */
+static void drawWrappedText(Font &font, const char *text, int x, int y,
+                            int maxWidth, int lineHeight, int maxLines,
+                            uint8_t color)
+{
+    String remaining(text);
+    for (int line = 0; line < maxLines && !remaining.isEmpty(); ++line)
+    {
+        int len = 0;
+        while (len < remaining.length() &&
+               textWidth(font, remaining.substring(0, len + 1).c_str(), 1.0f)
+                   <= maxWidth)
+            ++len;
+        if (len == 0)
+            len = 1;
+
+        bool more = len < remaining.length();
+        if (more && line < maxLines - 1)
+        {
+            int space = remaining.lastIndexOf(' ', len - 1);
+            if (space > 0)
+                len = space;
+        }
+
+        String row = remaining.substring(0, len);
+        row.trim();
+        if (more && line == maxLines - 1)
+        {
+            while (row.length() > 1 &&
+                   textWidth(font, (row + "...").c_str(), 1.0f) > maxWidth)
+                row.remove(row.length() - 1);
+            row += "...";
+        }
+        drawText(font, row.c_str(), x, y + line * lineHeight, 1.0f,
+                 ALIGN_LEFT, color);
+
+        remaining = remaining.substring(len);
+        remaining.trim();
+    }
+}
+
+static void drawCalendarEvents()
+{
+    const int regionX = 350;                          /* clear of the current icon */
+    const int regionRight = CANVAS_WIDTH - SIDE_MARGIN;
+    const int regionWidth = regionRight - regionX;
+    const int boxGap = 12;
+    const int boxWidth =
+        (regionWidth - (CALENDAR_EVENT_COUNT - 1) * boxGap) / CALENDAR_EVENT_COUNT;
+    /* Same top edge and height as the large current-conditions icon. */
+    const int boxTop = CURRENT_ICON_Y;
+    const int boxHeight = CURRENT_ICON_SIZE;
+    const int inset = 14;
+
+    for (int i = 0; i < CALENDAR_EVENT_COUNT; ++i)
+    {
+        int x = regionX + i * (boxWidth + boxGap);
+        drawRoundRect(x, boxTop, boxWidth, boxHeight, 12, 0);
+        if ((size_t)i >= calendarEventCount)
+            continue;
+
+        const CalendarEvent &event = calendarEvents[i];
+        struct tm timeinfo;
+        localtime_r(&event.start, &timeinfo);
+
+        /* Title, rule, date, time, rule, notes -- spread over the full icon
+         * height instead of the shorter box used before. */
+        drawTextFitted(iconFont, event.title, x + inset, boxTop + 20,
+                       boxWidth - 2 * inset, 1.0f, ALIGN_LEFT, 0);
+        epd_fill_rect(x + inset, boxTop + 58, boxWidth - 2 * inset, 1,
+                      0, framebuffer);
+
+        char dateLine[24];
+        snprintf(dateLine, sizeof(dateLine), "%s %02d %s",
+                 WEEKDAY_NAMES[timeinfo.tm_wday], timeinfo.tm_mday,
+                 MONTH_NAMES[timeinfo.tm_mon]);
+        drawText(iconFont, dateLine, x + inset, boxTop + 70,
+                 1.0f, ALIGN_LEFT, 0);
+
+        char timeLine[16];
+        if (event.allDay)
+            snprintf(timeLine, sizeof(timeLine), "All day");
+        else
+            snprintf(timeLine, sizeof(timeLine), "%02d:%02d",
+                     timeinfo.tm_hour, timeinfo.tm_min);
+        drawTextFitted(currentFont, timeLine, x + inset, boxTop + 104,
+                       boxWidth - 2 * inset, 1.0f, ALIGN_LEFT, 0);
+
+        epd_fill_rect(x + inset, boxTop + 154, boxWidth - 2 * inset, 1,
+                      0, framebuffer);
+        if (event.notes[0] != '\0')
+            drawWrappedText(iconFont, event.notes, x + inset, boxTop + 168,
+                            boxWidth - 2 * inset, 26, 4, 0);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Canvas composition                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -544,8 +1404,8 @@ static void composeImage()
 {
     memset(framebuffer, 0xFF, CANVAS_WIDTH * CANVAS_HEIGHT / 2);
 
-    /* Battery level in the top-left corner, above the current icon. */
-    drawBattery(SIDE_MARGIN, 12);
+    /* Battery level in the top-right corner. */
+    drawBattery(CANVAS_WIDTH - SIDE_MARGIN, 12);
 
     int currentIndex = 0;
     int upcoming[FORECAST_COUNT];
@@ -553,14 +1413,19 @@ static void composeImage()
     const ForecastRow &current = forecast[currentIndex];
 
     /* Current conditions: twice the forecast icon size, top left. */
-    int currentX = (int)(SIDE_MARGIN * 1.5);
-    int currentY = (int)(TOP_MARGIN * 1.5);
-    int currentSize = ICON_SIZE * 2;
+    int currentX = CURRENT_ICON_X;
+    int currentY = CURRENT_ICON_Y;
+    int currentSize = CURRENT_ICON_SIZE;
     char text[24];
 
     drawIcon(current.code, currentX, currentY, currentSize);
+    /* Time above the current icon, positioned like the forecast hour labels
+     * but using the larger Ubuntu32 font. */
+    snprintf(text, sizeof(text), "%.5s", current.time + 11);
+    drawIconLabel(currentFont, text, currentX, currentY, currentSize,
+                  0.5f, 0.14f, ALIGN_CENTER, 32);
     snprintf(text, sizeof(text), "%d\xB0", (int)ceilf(current.temp));
-    drawIconLabel(currentFont, text, currentX, currentY, currentSize, 0.06f, 0.80f, ALIGN_LEFT);
+    drawIconLabel(dateFont, text, currentX, currentY, currentSize, 0.06f, 0.80f, ALIGN_LEFT);
     snprintf(text, sizeof(text), "%dkts", (int)lroundf(current.wind * 1.943844f));
     drawIconLabel(currentFont, text, currentX, currentY, currentSize, 0.06f, 0.92f, ALIGN_LEFT);
     snprintf(text, sizeof(text), "%d%%", current.prob);
@@ -568,31 +1433,18 @@ static void composeImage()
     snprintf(text, sizeof(text), "%.1fmm", current.precip);
     drawIconLabel(currentFont, text, currentX, currentY, currentSize, 0.94f, 0.90f, ALIGN_RIGHT);
 
-    /* UTC clock in Ubuntu225 at native scale (1:1, no resampling). */
-    time_t now = time(nullptr);
-    struct tm timeinfo;
-    gmtime_r(&now, &timeinfo);
-    char clockString[6];
-    snprintf(clockString, sizeof(clockString), "%02d:%02d",
-             timeinfo.tm_hour, timeinfo.tm_min);
-
-    int clockWidth = textWidth(clockFont, clockString, 1.0f);
-    drawText(clockFont, clockString, CANVAS_WIDTH - SIDE_MARGIN - clockWidth,
-             TOP_MARGIN * 3, 1.0f, ALIGN_LEFT, 0);
-
-    /* Date from the current forecast row, above the clock. */
-    static const char *weekdays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
-    static const char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    /* Date from the current forecast row. */
     int year, month, day, hour, minute;
     sscanf(current.time, "%4d-%2d-%2dT%2d:%2d", &year, &month, &day, &hour, &minute);
     char dateString[32];
     snprintf(dateString, sizeof(dateString), "%s %02d %s %04d",
-             weekdays[dayOfWeek(year, month, day)], day, months[month - 1], year);
-    /* Date in Ubuntu42 at native scale (1:1, no resampling). */
-    drawText(dateFont, dateString,
-             CANVAS_WIDTH - SIDE_MARGIN - textWidth(dateFont, dateString, 1.0f),
-             TOP_MARGIN, 1.0f, ALIGN_LEFT, 0);
+             WEEKDAY_NAMES[dayOfWeek(year, month, day)], day,
+             MONTH_NAMES[month - 1], year);
+    /* Date in Ubuntu42 at native scale (1:1, no resampling), top left. */
+    drawText(dateFont, dateString, SIDE_MARGIN, TOP_MARGIN,
+             1.0f, ALIGN_LEFT, 0);
+
+    drawCalendarEvents();
 
     /* Six hourly icons along the bottom with their labels. */
     int span = CANVAS_WIDTH - 2 * SIDE_MARGIN - ICON_SIZE;
@@ -606,7 +1458,7 @@ static void composeImage()
         char hourString[6];
         snprintf(hourString, sizeof(hourString), "%.5s", row.time + 11);
         drawIconLabel(iconFont, hourString, x, yPosition, ICON_SIZE, 0.5f, 0.14f,
-                      ALIGN_CENTER);
+                      ALIGN_CENTER, 10);
 
         snprintf(text, sizeof(text), "%d\xB0", (int)ceilf(row.temp));
         drawIconLabel(iconFont, text, x, yPosition, ICON_SIZE, 0.06f, 0.80f,
@@ -621,6 +1473,20 @@ static void composeImage()
         drawIconLabel(iconFont, text, x, yPosition, ICON_SIZE, 0.94f, 0.90f,
                       ALIGN_RIGHT);
     }
+}
+
+/* 64-bit FNV-1a over the 4-bpp framebuffer.  Used to detect whether the newly
+ * composed image differs from the one currently on the e-paper. */
+static uint64_t framebufferHash()
+{
+    uint64_t hash = 14695981039346656037ULL; /* FNV-1a 64-bit offset basis */
+    size_t size = (size_t)(CANVAS_WIDTH / 2) * CANVAS_HEIGHT;
+    for (size_t i = 0; i < size; ++i)
+    {
+        hash ^= framebuffer[i];
+        hash *= 1099511628211ULL;            /* FNV-1a 64-bit prime */
+    }
+    return hash;
 }
 
 static void refreshDisplay()
@@ -662,22 +1528,37 @@ void loop()
         (millis() - lastDataRefreshMs >= DATA_REFRESH_INTERVAL_MS))
     {
         bool updated = false;
+        bool calendarUpdated = false;
         if (connectToWiFi())
         {
             syncUtcTime();
             updated = fetchForecast();
+            calendarUpdated = fetchCalendarEvents();
             disconnectWiFi();
         }
         lastDataRefreshMs = millis();
         dataRefreshDue = false;
         Serial.println(updated ? "Forecast updated"
                                : "Keeping previous forecast");
+        Serial.println(calendarUpdated ? "Calendar updated"
+                                       : "Keeping previous calendar events");
     }
 
-    /* The display itself (including the clock) updates every minute. */
+    /* Compose into the framebuffer and only drive the e-paper when the image
+     * has changed since the last refresh. */
     composeImage();
-    refreshDisplay();
-    Serial.println("Display updated");
+    uint64_t hash = framebufferHash();
+    if (!displayInitialized || hash != lastDisplayedHash)
+    {
+        refreshDisplay();
+        lastDisplayedHash = hash;
+        displayInitialized = true;
+        Serial.println("Display updated");
+    }
+    else
+    {
+        Serial.println("Display unchanged, skipping refresh");
+    }
 
-    delay(REFRESH_INTERVAL_MS);
+    delay(LOOP_INTERVAL_MS);
 }

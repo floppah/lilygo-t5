@@ -12,4 +12,14 @@ static const char *API_KEY = "your-met-office-api-key";
 static const char *LATITUDE = "your-latitude";
 static const char *LONGITUDE = "your-longitude";
 
+/* iCloud CalDAV calendar access. Generate an app-specific password at
+ * https://appleid.apple.com (Sign-In & Security -> App-Specific Passwords). */
+static const char *ICLOUD_USERNAME = "your-apple-id@example.com";
+static const char *ICLOUD_APP_PASSWORD = "your-icloud-app-password";
+
+/* POSIX timezone used to interpret calendar times that carry a TZID but no
+ * UTC offset. Europe/Berlin / Europe/Vienna: "CET-1CEST,M3.5.0,M10.5.0/3"
+ * Use "UTC0" if your calendar is in UTC. */
+static const char *ICLOUD_TZ = "CET-1CEST,M3.5.0,M10.5.0/3";
+
 #endif // CREDS_H
