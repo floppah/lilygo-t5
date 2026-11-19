@@ -117,7 +117,11 @@ static const char *ICLOUD_ROOT_CA =
 #define CALENDAR_TITLE_LEN 64
 #define CALENDAR_NOTES_LEN 160
 #define LOOP_INTERVAL_MS (5UL * 60UL * 1000UL)
-#define DATA_REFRESH_INTERVAL_MS (30UL * 60UL * 1000UL)
+/* Data is fetched on the wall clock at :01 and :31.  While the clock is still
+ * unset (before the first NTP sync) retries use this interval instead. */
+#define DATA_REFRESH_FALLBACK_MS (30UL * 60UL * 1000UL)
+#define REFRESH_MINUTE_EARLY 1
+#define REFRESH_MINUTE_LATE 31
 
 /* Hard caps for HTTP response bodies.  HTTPClient::getString() buffers the
  * whole payload with no limit, so without these a large or hostile response
@@ -192,6 +196,7 @@ static Font currentFont = { CURRENT_FONT_BITS, 0, 0, 0, false };
 static Font calendarFont = { CALENDAR_FONT_BITS, 0, 0, 0, false };
 
 static unsigned long lastDataRefreshMs = 0;
+static time_t lastFetchTime = 0;
 static bool dataRefreshDue = true;
 static uint64_t lastDisplayedHash = 0;
 static bool displayInitialized = false;
@@ -1838,6 +1843,62 @@ static void refreshDisplay()
     epd_poweroff();
 }
 
+static bool timeIsValid()
+{
+    return time(nullptr) >= 1600000000L;
+}
+
+/* Start of the refresh slot that `now` falls inside (:01 or :31 minute), or 0
+ * when the current minute is not a slot. */
+static time_t refreshSlotStart(time_t now)
+{
+    struct tm timeinfo;
+    localtime_r(&now, &timeinfo);
+    if (timeinfo.tm_min != REFRESH_MINUTE_EARLY &&
+        timeinfo.tm_min != REFRESH_MINUTE_LATE)
+        return 0;
+    return now - timeinfo.tm_sec;
+}
+
+/* True when a slot is open and nothing has been fetched since it began. */
+static bool refreshDue()
+{
+    if (dataRefreshDue)
+        return true;
+    if (!timeIsValid())
+        return millis() - lastDataRefreshMs >= DATA_REFRESH_FALLBACK_MS;
+
+    time_t now = time(nullptr);
+    time_t slot = refreshSlotStart(now);
+    /* The 60 s guard avoids a second fetch when a cycle happened to finish
+     * just before the slot opened. */
+    return slot != 0 && lastFetchTime < slot && now - lastFetchTime >= 60;
+}
+
+/* Milliseconds until the next fetch slot (:01 or :31 local time); 0 when one
+ * is due now.  Falls back to a fixed interval while the clock is unset. */
+static uint32_t msUntilNextRefresh()
+{
+    if (!timeIsValid())
+    {
+        unsigned long elapsed = millis() - lastDataRefreshMs;
+        return elapsed >= DATA_REFRESH_FALLBACK_MS
+                   ? 0
+                   : (uint32_t)(DATA_REFRESH_FALLBACK_MS - elapsed);
+    }
+
+    time_t now = time(nullptr);
+    struct tm timeinfo;
+    localtime_r(&now, &timeinfo);
+
+    int minute = timeinfo.tm_min;
+    int target = minute < REFRESH_MINUTE_EARLY ? REFRESH_MINUTE_EARLY
+               : minute < REFRESH_MINUTE_LATE  ? REFRESH_MINUTE_LATE
+                                               : 60 + REFRESH_MINUTE_EARLY;
+    int seconds = target * 60 - (minute * 60 + timeinfo.tm_sec);
+    return seconds > 0 ? (uint32_t)seconds * 1000UL : 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Arduino entry points                                                */
 /* ------------------------------------------------------------------ */
@@ -1863,10 +1924,9 @@ void setup()
 
 void loop()
 {
-    /* NTP time and forecast data are refreshed together, every half hour.
-     * WiFi is only powered up for the duration of this cycle. */
-    if (dataRefreshDue ||
-        (millis() - lastDataRefreshMs >= DATA_REFRESH_INTERVAL_MS))
+    /* NTP time, forecast and calendar are refreshed together at :01 and :31
+     * past the hour.  WiFi is only powered up for the duration of that cycle. */
+    if (refreshDue())
     {
         bool updated = false;
         bool calendarUpdated = false;
@@ -1879,6 +1939,7 @@ void loop()
         }
         sampleBattery();
         lastDataRefreshMs = millis();
+        lastFetchTime = time(nullptr);
         dataRefreshDue = false;
         Serial.println(updated ? "Forecast updated"
                                : "Keeping previous forecast");
@@ -1902,5 +1963,10 @@ void loop()
         Serial.println("Display unchanged, skipping refresh");
     }
 
-    delay(LOOP_INTERVAL_MS);
+    /* Sleep up to the next slot, keeping the existing five minute heartbeat so
+     * the image hash still gets rechecked now and then. */
+    uint32_t wait = msUntilNextRefresh();
+    if (wait == 0)
+        wait = 1000;                     /* slot just served; recheck shortly */
+    delay(wait < LOOP_INTERVAL_MS ? wait : LOOP_INTERVAL_MS);
 }
