@@ -8,7 +8,10 @@
  *
  * This is the ESP32 translation of ../weather.ipynb.  The icons come from
  * ../icons and are embedded as 4-bit greyscale data in weather_icons.h
- * (regenerate with tools/generate_icons.py).
+ * (regenerate with tools/generate_icons.py).  The thermometer and raindrop
+ * beside the current conditions come from the SVG icons in this directory and
+ * are embedded as 1-bit data in mono_icons.h
+ * (regenerate with tools/generate_mono_icons.py).
  */
 
 #include <Arduino.h>
@@ -31,6 +34,7 @@
 #include "Ubuntu25.h"
 #include "Ubuntu32.h"
 #include "weather_icons.h"
+#include "mono_icons.h"
 #include "creds.h"
 
 /* ------------------------------------------------------------------ */
@@ -97,11 +101,13 @@ static const char *ICLOUD_ROOT_CA =
 #define SIDE_MARGIN 20
 #define TOP_MARGIN 20
 #define BOTTOM_MARGIN 20
-/* Geometry of the large current-conditions icon, shared with the calendar
- * boxes so their top edge and height always line up with it. */
+/* Geometry of the large current-conditions icon.  The calendar boxes share
+ * its bottom edge but are 30 px shorter, with the height taken off the top. */
 #define CURRENT_ICON_X ((int)(SIDE_MARGIN * 1.5))
 #define CURRENT_ICON_Y ((int)(TOP_MARGIN * 1.5) + 25)
 #define CURRENT_ICON_SIZE (ICON_SIZE * 2)
+/* Gap between a 1-bit glyph and the label it sits beside. */
+#define ICON_LABEL_GAP 4
 #define FORECAST_COUNT 6 /* hourly icons */
 #define MAX_FORECAST_ROWS 64
 #define CALENDAR_EVENT_COUNT 3
@@ -189,6 +195,9 @@ static unsigned long lastDataRefreshMs = 0;
 static bool dataRefreshDue = true;
 static uint64_t lastDisplayedHash = 0;
 static bool displayInitialized = false;
+static int batteryPercent = 0;
+static float batteryVoltage = 0.0f;
+static bool batteryValid = false;
 static CalendarEvent calendarEvents[MAX_ICAL_EVENTS];
 static size_t calendarEventCount = 0;
 
@@ -1336,10 +1345,35 @@ static void drawIcon(int code, int x, int y, int size)
     }
 }
 
+/* Draw one of the 1-bit mono_icons.h glyphs with its top-left at (x, y).  The
+ * bitmaps mark 1 as background, so only the clear pixels are drawn. */
+static void drawMonoIcon(const uint8_t *data, int width, int height, int x, int y)
+{
+    for (int dy = 0; dy < height; ++dy)
+    {
+        for (int dx = 0; dx < width; ++dx)
+        {
+            uint8_t byte = pgm_read_byte(data + dy * (width / 8) + dx / 8);
+            if (byte & (0x80 >> (dx & 7)))
+                continue;
+            int px = x + dx;
+            int py = y + dy;
+            if (px < 0 || px >= CANVAS_WIDTH || py < 0 || py >= CANVAS_HEIGHT)
+                continue;
+            epd_draw_pixel(px, py, 0, framebuffer);
+        }
+    }
+}
+
 /* Battery level, adapted from the original OWM_EPD47_epaper_v2.5 sketch.
  * GPIO36 (ADC1_CH0) reads the divider on the LilyGo T5 4.7 board.  The
- * eFuse-calibrated Vref is used when available, otherwise the default 1100 mV. */
-static void drawBattery(int rightEdge, int y)
+ * eFuse-calibrated Vref is used when available, otherwise the default 1100 mV.
+ *
+ * The ADC is sampled once per data refresh and cached.  Sampling it while
+ * composing the image let ADC noise change the drawn percentage every loop,
+ * which made the framebuffer hash differ and forced a full refresh every five
+ * minutes even when the forecast and calendar were unchanged. */
+static void sampleBattery()
 {
     static uint32_t vref = 1100;
     esp_adc_cal_characteristics_t adcChars;
@@ -1351,7 +1385,12 @@ static void drawBattery(int rightEdge, int y)
 
     float voltage = analogRead(36) / 4096.0f * 6.566f * (vref / 1000.0f);
     if (voltage <= 1.0f)
-        return; /* No valid reading (e.g. running on USB only). */
+    {
+        /* No valid reading (e.g. running on USB only). */
+        batteryValid = false;
+        Serial.println("Battery: no valid reading");
+        return;
+    }
 
     float level = 2836.9625f * powf(voltage, 4) -
                   43987.4889f * powf(voltage, 3) +
@@ -1361,11 +1400,21 @@ static void drawBattery(int rightEdge, int y)
         level = 100.0f;
     if (voltage <= 3.20f)
         level = 0.0f;
-    int percentage = (int)lroundf(std::max(0.0f, std::min(100.0f, level)));
-    Serial.printf("Battery: %d%%, %.2fV\n", percentage, voltage);
+
+    batteryVoltage = voltage;
+    float clamped = std::max(0.0f, std::min(100.0f, level));
+    batteryPercent = (int)(lroundf(clamped / 5.0f) * 5.0f);
+    batteryValid = true;
+    Serial.printf("Battery: %d%%, %.2fV\n", batteryPercent, batteryVoltage);
+}
+
+static void drawBattery(int rightEdge, int y)
+{
+    if (!batteryValid)
+        return;
 
     char text[16];
-    snprintf(text, sizeof(text), "%d%% %.1fV", percentage, voltage);
+    snprintf(text, sizeof(text), "%d%%", batteryPercent);
 
     const int bodyWidth = 40, bodyHeight = 16;
     int width = bodyWidth + 4 + 9 + textWidth(iconFont, text, 1.0f);
@@ -1373,7 +1422,7 @@ static void drawBattery(int rightEdge, int y)
 
     epd_draw_rect(x, y, bodyWidth, bodyHeight, 0, framebuffer);
     epd_fill_rect(x + bodyWidth, y + 5, 4, 6, 0, framebuffer);
-    int fillWidth = (bodyWidth - 4) * percentage / 100;
+    int fillWidth = (bodyWidth - 4) * batteryPercent / 100;
     if (fillWidth > 0)
         epd_fill_rect(x + 2, y + 2, fillWidth, bodyHeight - 4, 0, framebuffer);
 
@@ -1655,12 +1704,40 @@ static void composeImage()
     snprintf(text, sizeof(text), "%.5s", current.time + 11);
     drawIconLabel(currentFont, text, currentX, currentY, currentSize,
                   0.5f, 0.14f, ALIGN_CENTER, 32);
+    /* Current temperature, preceded by the thermometer glyph.  The glyph
+     * occupies the old label position and the text moves right by its width
+     * plus a small gap, so the pair still sits in the icon's bottom-left
+     * corner.  The glyph is centred on the digits, whose visual height is
+     * shorter than the font's ascent. */
     snprintf(text, sizeof(text), "%d\xB0", (int)ceilf(current.temp));
-    drawIconLabel(dateFont, text, currentX, currentY, currentSize, 0.06f, 0.80f, ALIGN_LEFT);
+    ensureFont(dateFont);
+    int thermometerX = currentX + (int)(0.06f * currentSize);
+    int tempBaseline = currentY + (int)(0.80f * currentSize);
+    int tempTop = tempBaseline - dateFont.ascent;
+    int thermometerY = tempBaseline -
+                       (dateFont.ascent - (dateFont.lineHeight - dateFont.ascent)) / 2 -
+                       THERMOMETER_ICON_HEIGHT / 2;
+    drawMonoIcon(thermometer_icon_data, THERMOMETER_ICON_WIDTH,
+                 THERMOMETER_ICON_HEIGHT, thermometerX, thermometerY);
+    drawText(dateFont, text, thermometerX + THERMOMETER_ICON_WIDTH + ICON_LABEL_GAP,
+             tempTop, 1.0f, ALIGN_LEFT, 0);
     snprintf(text, sizeof(text), "%dkts", (int)lroundf(current.wind * 1.943844f));
     drawIconLabel(currentFont, text, currentX, currentY, currentSize, 0.06f, 0.92f, ALIGN_LEFT);
+    /* Precipitation chance, with the raindrop glyph to its right.  The glyph
+     * occupies the old right margin and the text moves left by its width plus
+     * a small gap to make room for it. */
     snprintf(text, sizeof(text), "%d%%", current.prob);
-    drawIconLabel(currentFont, text, currentX, currentY, currentSize, 0.94f, 0.80f, ALIGN_RIGHT);
+    ensureFont(currentFont);
+    int precipRight = currentX + (int)(0.94f * currentSize);
+    int precipBaseline = currentY + (int)(0.80f * currentSize);
+    int precipTop = precipBaseline - currentFont.ascent;
+    int raindropY = precipBaseline -
+                    (currentFont.ascent - (currentFont.lineHeight - currentFont.ascent)) / 2 -
+                    RAINDROP_ICON_HEIGHT / 2;
+    drawMonoIcon(raindrop_icon_data, RAINDROP_ICON_WIDTH, RAINDROP_ICON_HEIGHT,
+                 precipRight - RAINDROP_ICON_WIDTH, raindropY);
+    drawText(currentFont, text, precipRight - RAINDROP_ICON_WIDTH - ICON_LABEL_GAP,
+             precipTop, 1.0f, ALIGN_RIGHT, 0);
     snprintf(text, sizeof(text), "%.1fmm", current.precip);
     drawIconLabel(currentFont, text, currentX, currentY, currentSize, 0.94f, 0.90f, ALIGN_RIGHT);
 
@@ -1776,6 +1853,7 @@ void loop()
             calendarUpdated = fetchCalendarEvents();
             disconnectWiFi();
         }
+        sampleBattery();
         lastDataRefreshMs = millis();
         dataRefreshDue = false;
         Serial.println(updated ? "Forecast updated"
