@@ -733,7 +733,10 @@ static bool parseIcsTime(const String &value, const String &params,
     return true;
 }
 
-static String icsUnescapeText(const String &s)
+/* keepLineBreaks: notes are drawn by drawWrappedText(), which understands
+ * explicit newlines; titles are drawn on a single line, so a break there
+ * would render as a missing glyph. */
+static String icsUnescapeText(const String &s, bool keepLineBreaks = false)
 {
     String out;
     out.reserve(s.length());
@@ -742,7 +745,8 @@ static String icsUnescapeText(const String &s)
         if (s[i] == '\\' && i + 1 < s.length())
         {
             char c = s[++i];
-            if (c == 'n' || c == 'N') out += ' ';
+            if (c == 'n' || c == 'N')
+                out += keepLineBreaks ? '\n' : ' ';
             else out += c;
         }
         else
@@ -1017,7 +1021,7 @@ static void parseCalendarData(const String &ics,
             else if (name == "SUMMARY")
                 title = icsUnescapeText(value);
             else if (name == "DESCRIPTION")
-                notes = icsUnescapeText(value);
+                notes = icsUnescapeText(value, true);
             else if (name == "RRULE")
                 rrule = value;
             else if (name == "EXDATE")
@@ -1564,45 +1568,65 @@ static void drawTextFitted(Font &font, const char *text, int x, int y,
     drawText(font, value.c_str(), x, y, scale, align, color);
 }
 
-/* Greedy word wrap used for calendar notes.  Up to maxLines lines are drawn;
- * the final line gets an ellipsis if the text does not fit. */
+/* Greedy word wrap used for calendar notes.  An explicit newline in the note
+ * starts a new row; otherwise up to maxLines rows are drawn, and the final row
+ * gets an ellipsis if the text does not fit. */
 static void drawWrappedText(Font &font, const char *text, int x, int y,
                             int maxWidth, int lineHeight, int maxLines,
                             uint8_t color)
 {
     String remaining(text);
-    for (int line = 0; line < maxLines && !remaining.isEmpty(); ++line)
+    remaining.replace("\r\n", "\n");
+    remaining.replace("\r", "\n");
+    remaining.trim();
+
+    int line = 0;
+    while (line < maxLines && !remaining.isEmpty())
     {
-        int len = 0;
-        while (len < remaining.length() &&
-               textWidth(font, remaining.substring(0, len + 1).c_str(), 1.0f)
-                   <= maxWidth)
-            ++len;
-        if (len == 0)
-            len = 1;
-
-        bool more = len < remaining.length();
-        if (more && line < maxLines - 1)
-        {
-            int space = remaining.lastIndexOf(' ', len - 1);
-            if (space > 0)
-                len = space;
-        }
-
-        String row = remaining.substring(0, len);
-        row.trim();
-        if (more && line == maxLines - 1)
-        {
-            while (row.length() > 1 &&
-                   textWidth(font, (row + "...").c_str(), 1.0f) > maxWidth)
-                row.remove(row.length() - 1);
-            row += "...";
-        }
-        drawText(font, row.c_str(), x, y + line * lineHeight, 1.0f,
-                 ALIGN_LEFT, color);
-
-        remaining = remaining.substring(len);
+        int newline = remaining.indexOf('\n');
+        String paragraph =
+            newline < 0 ? remaining : remaining.substring(0, newline);
+        remaining = newline < 0 ? String() : remaining.substring(newline + 1);
+        paragraph.trim();
         remaining.trim();
+        if (paragraph.isEmpty())
+            continue;
+
+        while (!paragraph.isEmpty() && line < maxLines)
+        {
+            int len = 0;
+            while (len < paragraph.length() &&
+                   textWidth(font, paragraph.substring(0, len + 1).c_str(), 1.0f)
+                       <= maxWidth)
+                ++len;
+            if (len == 0)
+                len = 1;
+
+            bool fitsWhole = len >= paragraph.length();
+            bool more = !fitsWhole || !remaining.isEmpty();
+            if (!fitsWhole && line < maxLines - 1)
+            {
+                int space = paragraph.lastIndexOf(' ', len - 1);
+                if (space > 0)
+                    len = space;
+            }
+
+            String row = paragraph.substring(0, len);
+            row.trim();
+            if (more && line == maxLines - 1)
+            {
+                while (row.length() > 1 &&
+                       textWidth(font, (row + "...").c_str(), 1.0f) > maxWidth)
+                    row.remove(row.length() - 1);
+                row += "...";
+            }
+            drawText(font, row.c_str(), x, y + line * lineHeight, 1.0f,
+                     ALIGN_LEFT, color);
+            ++line;
+
+            paragraph = paragraph.substring(len);
+            paragraph.trim();
+        }
     }
 }
 
