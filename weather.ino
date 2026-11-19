@@ -15,6 +15,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <StreamString.h>
 #include <ArduinoJson.h>
 #include <algorithm>
 #include <math.h>
@@ -101,7 +102,7 @@ static const char *ICLOUD_ROOT_CA =
 #define CURRENT_ICON_X ((int)(SIDE_MARGIN * 1.5))
 #define CURRENT_ICON_Y ((int)(TOP_MARGIN * 1.5) + 25)
 #define CURRENT_ICON_SIZE (ICON_SIZE * 2)
-#define FORECAST_COUNT 6
+#define FORECAST_COUNT 6 /* hourly icons */
 #define MAX_FORECAST_ROWS 64
 #define CALENDAR_EVENT_COUNT 3
 #define CALENDAR_WINDOW_DAYS 14
@@ -111,6 +112,12 @@ static const char *ICLOUD_ROOT_CA =
 #define CALENDAR_NOTES_LEN 160
 #define LOOP_INTERVAL_MS (5UL * 60UL * 1000UL)
 #define DATA_REFRESH_INTERVAL_MS (30UL * 60UL * 1000UL)
+
+/* Hard caps for HTTP response bodies.  HTTPClient::getString() buffers the
+ * whole payload with no limit, so without these a large or hostile response
+ * could exhaust the heap. */
+#define MAX_FORECAST_BODY_BYTES (256UL * 1024UL)
+#define MAX_CALDAV_BODY_BYTES (256UL * 1024UL)
 
 /* The text fonts are TFT_eSPI "VLW" fonts: a header, one 28-byte metric record
  * per glyph and an 8-bit alpha bitmap per glyph.  Glyph count, ascent and
@@ -189,6 +196,78 @@ static size_t calendarEventCount = 0;
 /* Networking / time                                                   */
 /* ------------------------------------------------------------------ */
 
+/* A StreamString that refuses to grow past a fixed byte budget.  Passing this
+ * to HTTPClient::writeToStream() keeps response bodies bounded even when the
+ * server uses chunked transfer encoding (where Content-Length is unknown). */
+class BoundedStreamString : public StreamString
+{
+public:
+    explicit BoundedStreamString(size_t limit) : limit_(limit) {}
+
+    size_t write(const uint8_t *buffer, size_t size) override
+    {
+        if (overflowed_)
+            return 0;
+        size_t room = limit_ - length();
+        if (size > room)
+        {
+            size_t written = room > 0 ? StreamString::write(buffer, room) : 0;
+            overflowed_ = true;
+            return written;
+        }
+        return StreamString::write(buffer, size);
+    }
+
+    size_t write(uint8_t data) override
+    {
+        if (overflowed_ || length() >= limit_)
+        {
+            overflowed_ = true;
+            return 0;
+        }
+        return StreamString::write(data);
+    }
+
+    bool overflowed() const { return overflowed_; }
+
+private:
+    size_t limit_;
+    bool overflowed_ = false;
+};
+
+static bool readLimitedBody(HTTPClient &http, String &body, size_t limit)
+{
+    int announced = http.getSize();
+    if (announced > 0 && (size_t)announced > limit)
+    {
+        Serial.printf("Response body too large: %d bytes (limit %u)\n",
+                      announced, (unsigned)limit);
+        return false;
+    }
+
+    BoundedStreamString sink(limit);
+    if (announced > 0)
+        sink.reserve((size_t)announced + 1);
+    else
+        sink.reserve(16384);
+
+    int result = http.writeToStream(&sink);
+    if (sink.overflowed())
+    {
+        Serial.printf("Response body exceeded %u byte limit\n",
+                      (unsigned)limit);
+        return false;
+    }
+    if (result < 0)
+    {
+        Serial.printf("Reading response body failed: %d\n", result);
+        return false;
+    }
+
+    body = static_cast<const String &>(sink);
+    return true;
+}
+
 static bool connectToWiFi()
 {
     WiFi.mode(WIFI_STA);
@@ -260,8 +339,14 @@ static bool fetchForecast()
         return false;
     }
 
-    String payload = http.getString();
+    String payload;
+    bool received = readLimitedBody(http, payload, MAX_FORECAST_BODY_BYTES);
     http.end();
+    if (!received)
+    {
+        Serial.println("Forecast response rejected");
+        return false;
+    }
     Serial.printf("Received %u bytes of forecast data\n", payload.length());
 
     /* Only keep the six fields the canvas actually uses. */
@@ -451,27 +536,92 @@ static String calendarDataText(const String &data)
     return b < 0 ? data.substring(a) : data.substring(a, b);
 }
 
+/* iCloud returns absolute URLs, including partition hosts such as
+ * pXX-caldav.icloud.com.  Credentials are attached to every request, so only
+ * ever follow HTTPS URLs on icloud.com -- never a host chosen by the response. */
+static bool isTrustedCalDavUrl(const String &url)
+{
+    if (!url.startsWith("https://"))
+        return false;
+
+    /* Reject whitespace and control characters (request-splitting). */
+    for (int i = 0; i < (int)url.length(); ++i)
+    {
+        uint8_t c = (uint8_t)url[i];
+        if (c <= 0x20 || c == 0x7F)
+            return false;
+    }
+
+    String authority = url.substring(8);
+    int end = authority.length();
+    for (int i = 0; i < (int)authority.length(); ++i)
+    {
+        if (authority[i] == '/' || authority[i] == '?' || authority[i] == '#')
+        {
+            end = i;
+            break;
+        }
+    }
+    authority = authority.substring(0, end);
+
+    /* No userinfo tricks such as https://caldav.icloud.com@evil.example/. */
+    if (authority.indexOf('@') >= 0)
+        return false;
+
+    /* Drop an optional :port suffix; iCloud does not use one. */
+    int colon = authority.indexOf(':');
+    if (colon >= 0)
+        authority = authority.substring(0, colon);
+
+    authority.toLowerCase();
+    return authority == "icloud.com" || authority.endsWith(".icloud.com");
+}
+
 static String resolveCalDavUrl(const String &base, const String &href)
 {
+    String resolved;
     if (href.startsWith("http://") || href.startsWith("https://"))
-        return href;
-    int scheme = base.indexOf("://");
-    if (scheme < 0)
-        return href;
-    int hostStart = scheme + 3;
-    int slash = base.indexOf('/', hostStart);
-    String origin = slash < 0 ? base : base.substring(0, slash);
-    if (href.startsWith("/"))
-        return origin + href;
-    String path = slash < 0 ? String("/") : base.substring(slash);
-    int lastSlash = path.lastIndexOf('/');
-    return origin + path.substring(0, lastSlash + 1) + href;
+    {
+        resolved = href;
+    }
+    else
+    {
+        int scheme = base.indexOf("://");
+        if (scheme < 0)
+            return String();
+        int hostStart = scheme + 3;
+        int slash = base.indexOf('/', hostStart);
+        String origin = slash < 0 ? base : base.substring(0, slash);
+        if (href.startsWith("/"))
+        {
+            resolved = origin + href;
+        }
+        else
+        {
+            String path = slash < 0 ? String("/") : base.substring(slash);
+            int lastSlash = path.lastIndexOf('/');
+            resolved = origin + path.substring(0, lastSlash + 1) + href;
+        }
+    }
+
+    if (!isTrustedCalDavUrl(resolved))
+    {
+        Serial.println("CalDAV: refusing untrusted URL");
+        return String();
+    }
+    return resolved;
 }
 
 static bool calDavRequest(const String &url, const char *method,
                           const char *depth, const String &body,
                           String &response)
 {
+    if (!isTrustedCalDavUrl(url))
+    {
+        Serial.println("CalDAV: refusing request to untrusted URL");
+        return false;
+    }
+
     WiFiClientSecure client;
     client.setCACert(ICLOUD_ROOT_CA);
 
@@ -483,12 +633,19 @@ static bool calDavRequest(const String &url, const char *method,
     http.setTimeout(20000);
 
     int status = http.sendRequest(method, body);
+    bool ok = false;
     if (status >= 200 && status < 300)
-        response = http.getString();
+    {
+        ok = readLimitedBody(http, response, MAX_CALDAV_BODY_BYTES);
+        if (!ok)
+            Serial.printf("CalDAV %s response rejected\n", method);
+    }
     else
+    {
         Serial.printf("CalDAV %s %s failed: HTTP %d\n", method, url.c_str(), status);
+    }
     http.end();
-    return status >= 200 && status < 300;
+    return ok;
 }
 
 /* Howard Hinnant's civil-date algorithm: days since 1970-01-01. */
@@ -909,6 +1066,11 @@ static bool fetchCalendarEvents()
         return false;
     }
     String principalUrl = resolveCalDavUrl(root, href);
+    if (principalUrl.isEmpty())
+    {
+        Serial.println("CalDAV: untrusted principal URL");
+        return false;
+    }
 
     if (!calDavRequest(principalUrl, "PROPFIND", "0", homeSetBody, response))
         return false;
@@ -920,6 +1082,11 @@ static bool fetchCalendarEvents()
         return false;
     }
     String homeUrl = resolveCalDavUrl(principalUrl, href);
+    if (homeUrl.isEmpty())
+    {
+        Serial.println("CalDAV: untrusted calendar-home URL");
+        return false;
+    }
 
     if (!calDavRequest(homeUrl, "PROPFIND", "1", calendarListBody, response))
         return false;
@@ -939,7 +1106,11 @@ static bool fetchCalendarEvents()
             String calendarHref;
             if (xmlValue(block, "href", calendarHref) &&
                 calendarCount < MAX_CALENDARS)
-                calendarUrls[calendarCount++] = resolveCalDavUrl(homeUrl, calendarHref);
+            {
+                String calendarUrl = resolveCalDavUrl(homeUrl, calendarHref);
+                if (!calendarUrl.isEmpty())
+                    calendarUrls[calendarCount++] = calendarUrl;
+            }
         }
         pos = next;
     }
@@ -1216,13 +1387,45 @@ static void drawBattery(int rightEdge, int y)
 static int dayOfWeek(int year, int month, int day)
 {
     static const int offset[12] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+    if (month < 1 || month > 12)
+        return 0;
     if (month < 3)
         --year;
-    return (year + year / 4 - year / 100 + year / 400 + offset[month - 1] + day) % 7;
+    int dow = (year + year / 4 - year / 100 + year / 400 +
+               offset[month - 1] + day) % 7;
+    return dow < 0 ? dow + 7 : dow;
+}
+
+/* The API supplies timestamps like "YYYY-MM-DDTHH:MMZ".  Validate every field
+ * that is later used to index WEEKDAY_NAMES/MONTH_NAMES or dayOfWeek(). */
+static bool parseForecastTime(const char *text, int &year, int &month,
+                              int &day, int &hour, int &minute)
+{
+    int y = 0, m = 0, d = 0, h = 0, min = 0;
+    if (sscanf(text, "%4d-%2d-%2dT%2d:%2d", &y, &m, &d, &h, &min) != 5)
+        return false;
+    if (y < 1970 || y > 9999 || m < 1 || m > 12 || d < 1 || d > 31 ||
+        h < 0 || h > 23 || min < 0 || min > 59)
+        return false;
+
+    year = y;
+    month = m;
+    day = d;
+    hour = h;
+    minute = min;
+    return true;
 }
 
 static void selectForecast(int &currentIndex, int upcoming[FORECAST_COUNT])
 {
+    if (forecastCount == 0)
+    {
+        currentIndex = 0;
+        for (int i = 0; i < FORECAST_COUNT; ++i)
+            upcoming[i] = 0;
+        return;
+    }
+
     time_t now = time(nullptr);
     struct tm timeinfo;
     gmtime_r(&now, &timeinfo);
@@ -1426,6 +1629,15 @@ static void composeImage()
     /* Battery level in the top-right corner. */
     drawBattery(CANVAS_WIDTH - SIDE_MARGIN, 12);
 
+    if (forecastCount == 0)
+    {
+        ensureFont(dateFont);
+        drawText(dateFont, "No forecast data", CANVAS_WIDTH / 2,
+                 CANVAS_HEIGHT / 2 - dateFont.ascent / 2, 1.0f,
+                 ALIGN_CENTER, 0);
+        return;
+    }
+
     int currentIndex = 0;
     int upcoming[FORECAST_COUNT];
     selectForecast(currentIndex, upcoming);
@@ -1452,9 +1664,18 @@ static void composeImage()
     snprintf(text, sizeof(text), "%.1fmm", current.precip);
     drawIconLabel(currentFont, text, currentX, currentY, currentSize, 0.94f, 0.90f, ALIGN_RIGHT);
 
-    /* Date from the current forecast row. */
-    int year, month, day, hour, minute;
-    sscanf(current.time, "%4d-%2d-%2dT%2d:%2d", &year, &month, &day, &hour, &minute);
+    /* Date from the current forecast row, falling back to the system clock if
+     * the API supplied a malformed timestamp. */
+    int year = 0, month = 0, day = 0, hour = 0, minute = 0;
+    if (!parseForecastTime(current.time, year, month, day, hour, minute))
+    {
+        time_t now = time(nullptr);
+        struct tm timeinfo;
+        gmtime_r(&now, &timeinfo);
+        year = timeinfo.tm_year + 1900;
+        month = timeinfo.tm_mon + 1;
+        day = timeinfo.tm_mday;
+    }
     char dateString[32];
     snprintf(dateString, sizeof(dateString), "%s %02d %s %04d",
              WEEKDAY_NAMES[dayOfWeek(year, month, day)], day,
