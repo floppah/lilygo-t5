@@ -27,6 +27,7 @@
 #include "epd_driver.h"
 #include "Ubuntu42.h"
 #include "Ubuntu20.h"
+#include "Ubuntu25.h"
 #include "Ubuntu32.h"
 #include "weather_icons.h"
 #include "creds.h"
@@ -113,12 +114,13 @@ static const char *ICLOUD_ROOT_CA =
 
 /* The text fonts are TFT_eSPI "VLW" fonts: a header, one 28-byte metric record
  * per glyph and an 8-bit alpha bitmap per glyph.  Glyph count, ascent and
- * descent are read from each font header at runtime.  The date, current labels
- * and forecast labels use Ubuntu42, Ubuntu32 and Ubuntu20 at native scale
- * (1:1), so no text is resampled. */
+ * descent are read from each font header at runtime.  The date, current labels,
+ * forecast labels and calendar title/time use Ubuntu42, Ubuntu32, Ubuntu20 and
+ * Ubuntu25 at native scale (1:1), so no text is resampled. */
 #define DATE_FONT_BITS Ubuntu42
 #define ICON_FONT_BITS Ubuntu20
 #define CURRENT_FONT_BITS Ubuntu32
+#define CALENDAR_FONT_BITS Ubuntu25
 #define FONT_HEADER_SIZE 24
 #define FONT_METRIC_SIZE 28
 
@@ -174,6 +176,7 @@ static uint8_t *framebuffer = nullptr;
 static Font dateFont = { DATE_FONT_BITS, 0, 0, 0, false };
 static Font iconFont = { ICON_FONT_BITS, 0, 0, 0, false };
 static Font currentFont = { CURRENT_FONT_BITS, 0, 0, 0, false };
+static Font calendarFont = { CALENDAR_FONT_BITS, 0, 0, 0, false };
 
 static unsigned long lastDataRefreshMs = 0;
 static bool dataRefreshDue = true;
@@ -1257,28 +1260,38 @@ static void selectForecast(int &currentIndex, int upcoming[FORECAST_COUNT])
 /* ------------------------------------------------------------------ */
 
 static void drawRoundRect(int x, int y, int width, int height, int radius,
-                          uint8_t color)
+                          uint8_t color, int thickness = 1)
 {
     radius = std::min(radius, std::min(width, height) / 2);
-    for (int dy = 0; dy <= radius; ++dy)
+    thickness = std::max(1, std::min(thickness, std::min(width, height) / 2));
+    /* Draw the outline once per pixel of thickness, each pass one pixel
+     * further in, so the border reads as a solid stroke. */
+    for (int t = 0; t < thickness; ++t)
     {
-        int inset = radius -
-                    (int)lroundf(sqrtf((float)(radius * radius - dy * dy)));
-        epd_draw_pixel(x + inset, y + radius - dy, color, framebuffer);
-        epd_draw_pixel(x + width - 1 - inset, y + radius - dy, color, framebuffer);
-        epd_draw_pixel(x + inset, y + height - 1 - radius + dy, color, framebuffer);
-        epd_draw_pixel(x + width - 1 - inset, y + height - 1 - radius + dy,
-                       color, framebuffer);
-    }
-    for (int px = x + radius; px <= x + width - 1 - radius; ++px)
-    {
-        epd_draw_pixel(px, y, color, framebuffer);
-        epd_draw_pixel(px, y + height - 1, color, framebuffer);
-    }
-    for (int py = y + radius; py <= y + height - 1 - radius; ++py)
-    {
-        epd_draw_pixel(x, py, color, framebuffer);
-        epd_draw_pixel(x + width - 1, py, color, framebuffer);
+        int rx = x + t;
+        int ry = y + t;
+        int rw = width - 2 * t;
+        int rh = height - 2 * t;
+        int r = std::max(0, radius - t);
+        for (int dy = 0; dy <= r; ++dy)
+        {
+            int inset = r - (int)lroundf(sqrtf((float)(r * r - dy * dy)));
+            epd_draw_pixel(rx + inset, ry + r - dy, color, framebuffer);
+            epd_draw_pixel(rx + rw - 1 - inset, ry + r - dy, color, framebuffer);
+            epd_draw_pixel(rx + inset, ry + rh - 1 - r + dy, color, framebuffer);
+            epd_draw_pixel(rx + rw - 1 - inset, ry + rh - 1 - r + dy,
+                           color, framebuffer);
+        }
+        for (int px = rx + r; px <= rx + rw - 1 - r; ++px)
+        {
+            epd_draw_pixel(px, ry, color, framebuffer);
+            epd_draw_pixel(px, ry + rh - 1, color, framebuffer);
+        }
+        for (int py = ry + r; py <= ry + rh - 1 - r; ++py)
+        {
+            epd_draw_pixel(rx, py, color, framebuffer);
+            epd_draw_pixel(rx + rw - 1, py, color, framebuffer);
+        }
     }
 }
 
@@ -1349,17 +1362,23 @@ static void drawCalendarEvents()
     const int boxGap = 12;
     const int boxWidth =
         (regionWidth - (CALENDAR_EVENT_COUNT - 1) * boxGap) / CALENDAR_EVENT_COUNT;
-    /* Same top edge and height as the large current-conditions icon. */
-    const int boxTop = CURRENT_ICON_Y;
-    const int boxHeight = CURRENT_ICON_SIZE;
+    /* Bottom edge stays aligned with the current-conditions icon; the
+     * reduced height is taken from the top. */
+    const int boxHeight = CURRENT_ICON_SIZE - 30;
+    const int boxTop = CURRENT_ICON_Y + CURRENT_ICON_SIZE - boxHeight;
     const int inset = 14;
 
-    for (int i = 0; i < CALENDAR_EVENT_COUNT; ++i)
+    /* Draw only the boxes that have events, right-aligned in the region so
+     * they fill the slots nearest the right edge. */
+    const size_t shown = std::min(calendarEventCount,
+                                  (size_t)CALENDAR_EVENT_COUNT);
+    const int firstSlot = CALENDAR_EVENT_COUNT - (int)shown;
+
+    for (size_t i = 0; i < shown; ++i)
     {
-        int x = regionX + i * (boxWidth + boxGap);
-        drawRoundRect(x, boxTop, boxWidth, boxHeight, 12, 0);
-        if ((size_t)i >= calendarEventCount)
-            continue;
+        int slot = firstSlot + (int)i;
+        int x = regionX + slot * (boxWidth + boxGap);
+        drawRoundRect(x, boxTop, boxWidth, boxHeight, 12, 0, 3);
 
         const CalendarEvent &event = calendarEvents[i];
         struct tm timeinfo;
@@ -1367,16 +1386,16 @@ static void drawCalendarEvents()
 
         /* Title, rule, date, time, rule, notes -- spread over the full icon
          * height instead of the shorter box used before. */
-        drawTextFitted(iconFont, event.title, x + inset, boxTop + 20,
+        drawTextFitted(calendarFont, event.title, x + inset, boxTop + 20,
                        boxWidth - 2 * inset, 1.0f, ALIGN_LEFT, 0);
-        epd_fill_rect(x + inset, boxTop + 58, boxWidth - 2 * inset, 1,
+        epd_fill_rect(x + inset, boxTop + 56, boxWidth - 2 * inset, 1,
                       0, framebuffer);
 
         char dateLine[24];
         snprintf(dateLine, sizeof(dateLine), "%s %02d %s",
                  WEEKDAY_NAMES[timeinfo.tm_wday], timeinfo.tm_mday,
                  MONTH_NAMES[timeinfo.tm_mon]);
-        drawText(iconFont, dateLine, x + inset, boxTop + 70,
+        drawText(iconFont, dateLine, x + inset, boxTop + 66,
                  1.0f, ALIGN_LEFT, 0);
 
         char timeLine[16];
@@ -1385,13 +1404,13 @@ static void drawCalendarEvents()
         else
             snprintf(timeLine, sizeof(timeLine), "%02d:%02d",
                      timeinfo.tm_hour, timeinfo.tm_min);
-        drawTextFitted(currentFont, timeLine, x + inset, boxTop + 104,
+        drawTextFitted(calendarFont, timeLine, x + inset, boxTop + 98,
                        boxWidth - 2 * inset, 1.0f, ALIGN_LEFT, 0);
 
-        epd_fill_rect(x + inset, boxTop + 154, boxWidth - 2 * inset, 1,
+        epd_fill_rect(x + inset, boxTop + 142, boxWidth - 2 * inset, 1,
                       0, framebuffer);
         if (event.notes[0] != '\0')
-            drawWrappedText(iconFont, event.notes, x + inset, boxTop + 168,
+            drawWrappedText(iconFont, event.notes, x + inset, boxTop + 156,
                             boxWidth - 2 * inset, 26, 4, 0);
     }
 }
