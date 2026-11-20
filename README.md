@@ -13,7 +13,8 @@ for a fixed location and refreshes the display with:
   date, time and the event's notes (`DESCRIPTION`),
 - the next six hourly forecasts, each with a smaller thermometer and raindrop
   beside its temperature and precipitation chance,
-- a battery indicator (leave it off with `-D HAS_BATTERY=false`).
+- a battery indicator (leave it off with `-D HAS_BATTERY=false`), with a
+  no-wifi icon shown beside it when the last sync failed.
 
 The main loop keeps a five-minute heartbeat. Forecast and calendar data are
 fetched at :01 and :31 past the hour (with a fixed fallback interval until NTP

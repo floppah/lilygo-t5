@@ -4,14 +4,17 @@
 The current-conditions glyphs sit beside Ubuntu32 text (24 px digits); the
 forecast glyphs sit beside Ubuntu20 text (16 px digits).  The forecast
 thermometer is rendered at 20 px because its tube detail does not survive
-rasterising any smaller.  Icons are emitted as 1-bit bitmaps: MSB first,
-row-major from the top, 1 = background and 0 = black.
+rasterising any smaller.  The no-wifi glyph is shown beside the battery
+indicator and is rendered at 20 px to match the Ubuntu20 percentage text.
+Icons are emitted as 1-bit bitmaps: MSB first, row-major from the top,
+1 = background and 0 = black.
 
 Usage: generate_mono_icons.py [--out FILE]
 """
 
 from pathlib import Path
 import argparse
+import math
 import re
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,15 +23,85 @@ OUTPUT = ROOT / "mono_icons.h"
 
 THERMOMETER_SVG = ASSETS / "thermometer-icon.svg"
 RAINDROP_SVG = ASSETS / "raindrop-weather-svgrepo-com.svg"
+NO_WIFI_SVG = ASSETS / "no-wifi.svg"
 CURRENT_ICON_HEIGHT = 24            # Ubuntu32 digit height
 FORECAST_THERMOMETER_HEIGHT = 20    # smallest height that keeps the tube readable
 FORECAST_RAINDROP_HEIGHT = 16       # Ubuntu20 digit height
+NO_WIFI_HEIGHT = 20                 # Ubuntu20 digit height
 SUPERSAMPLE = 8
 BLACK_THRESHOLD = 0.4   # bias towards ink so the 1-px outlines stay continuous
 
 TOKEN = re.compile(r"[MmLlCcZzHhVvSsQqTtAa]|-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
 VIEWBOX = re.compile(r'viewBox="([-\d.]+) ([-\d.]+) ([\d.]+) ([\d.]+)"')
-PATH = re.compile(r'<path d="([^"]+)"')
+CIRCLE_ATTR = re.compile(r'\b(cx|cy|r)="([-\d.]+)"')
+ELEMENT = re.compile(r'<path\b[^>]*\bd="([^"]+)"|<circle\b[^>]*>')
+
+
+def _angle(ux: float, uy: float, vx: float, vy: float) -> float:
+    dot = ux * vx + uy * vy
+    length = math.hypot(ux, uy) * math.hypot(vx, vy)
+    if length == 0:
+        return 0.0
+    return math.copysign(math.acos(max(-1.0, min(1.0, dot / length))),
+                         ux * vy - uy * vx)
+
+
+def flatten_arc(x0: float, y0: float, rx: float, ry: float, phi: float,
+                large_arc: bool, sweep: bool, x: float, y: float,
+                scale: float) -> list[tuple[float, float]]:
+    """Sample an SVG elliptical arc (endpoint parameterisation) as points."""
+    rx, ry = abs(rx), abs(ry)
+    if rx == 0 or ry == 0:
+        return [(x * scale, y * scale)]
+
+    phi_rad = math.radians(phi)
+    cos_phi, sin_phi = math.cos(phi_rad), math.sin(phi_rad)
+    dx, dy = (x0 - x) / 2, (y0 - y) / 2
+    x1p = cos_phi * dx + sin_phi * dy
+    y1p = -sin_phi * dx + cos_phi * dy
+
+    lam = x1p * x1p / (rx * rx) + y1p * y1p / (ry * ry)
+    if lam > 1:
+        scale_r = math.sqrt(lam)
+        rx *= scale_r
+        ry *= scale_r
+
+    num = rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p
+    den = rx * rx * y1p * y1p + ry * ry * x1p * x1p
+    coef = (1 if large_arc != sweep else -1) * math.sqrt(
+        max(0.0, num / den) if den else 0.0)
+    cxp = coef * rx * y1p / ry
+    cyp = -coef * ry * x1p / rx
+    cx = cos_phi * cxp - sin_phi * cyp + (x0 + x) / 2
+    cy = sin_phi * cxp + cos_phi * cyp + (y0 + y) / 2
+
+    theta1 = _angle(1, 0, (x1p - cxp) / rx, (y1p - cyp) / ry)
+    dtheta = _angle((x1p - cxp) / rx, (y1p - cyp) / ry,
+                    (-x1p - cxp) / rx, (-y1p - cyp) / ry)
+    if not sweep and dtheta > 0:
+        dtheta -= 2 * math.pi
+    elif sweep and dtheta < 0:
+        dtheta += 2 * math.pi
+
+    steps = max(8, int(abs(dtheta) * 16 / math.pi))
+    return [
+        ((cx + rx * math.cos(theta1 + dtheta * i / steps) * cos_phi -
+          ry * math.sin(theta1 + dtheta * i / steps) * sin_phi) * scale,
+         (cy + rx * math.cos(theta1 + dtheta * i / steps) * sin_phi +
+          ry * math.sin(theta1 + dtheta * i / steps) * cos_phi) * scale)
+        for i in range(1, steps + 1)
+    ]
+
+
+def circle_polygon(tag: str, scale: float, segments: int = 64):
+    """Approximate a <circle> element as a polygon."""
+    values = {name: float(value) for name, value in CIRCLE_ATTR.findall(tag)}
+    cx, cy, r = values["cx"], values["cy"], values["r"]
+    return [
+        ((cx + r * math.cos(2 * math.pi * i / segments)) * scale,
+         (cy + r * math.sin(2 * math.pi * i / segments)) * scale)
+        for i in range(segments)
+    ]
 
 
 def flatten_path(d: str, scale: float) -> list[list[tuple[float, float]]]:
@@ -120,6 +193,19 @@ def flatten_path(d: str, scale: float) -> list[list[tuple[float, float]]]:
             current.append((x * scale, y * scale))
             continue
 
+        if command in "Aa":
+            rx, ry, rotation = number(), number(), number()
+            large_arc = bool(number())
+            sweep = bool(number())
+            if command == "A":
+                x, y = number(), number()
+            else:
+                x, y = x + number(), y + number()
+            current.extend(flatten_arc(current[-1][0] / scale,
+                                       current[-1][1] / scale, rx, ry,
+                                       rotation, large_arc, sweep, x, y, scale))
+            continue
+
         raise ValueError(f"unsupported SVG command {command!r}")
 
     if len(current) > 1:
@@ -158,12 +244,19 @@ def render_svg(path: Path, height: int, path_limit: int | None = None):
     width = (art_width + 7) // 8 * 8
     left = (width - art_width) // 2
 
-    paths = PATH.findall(source)
-    if path_limit is not None:
-        paths = paths[:path_limit]
     polygons = []
-    for d in paths:
-        polygons.extend(flatten_path(d, scale))
+    # Walk paths and circles in document order so overlapping art keeps its
+    # even-odd fill semantics.
+    path_count = 0
+    for element in ELEMENT.finditer(source):
+        d = element.group(1)
+        if d is not None:
+            if path_limit is not None and path_count >= path_limit:
+                continue
+            path_count += 1
+            polygons.extend(flatten_path(d, scale))
+        else:
+            polygons.append(circle_polygon(element.group(0), scale))
 
     black_at = BLACK_THRESHOLD * SUPERSAMPLE * SUPERSAMPLE
     rows = []
@@ -232,6 +325,7 @@ def main() -> None:
     drop_w, drop_h, drop_rows = render_svg(RAINDROP_SVG, CURRENT_ICON_HEIGHT, 1)
     small_therm = render_svg(THERMOMETER_SVG, FORECAST_THERMOMETER_HEIGHT)
     small_drop = render_svg(RAINDROP_SVG, FORECAST_RAINDROP_HEIGHT, 1)
+    no_wifi = render_svg(NO_WIFI_SVG, NO_WIFI_HEIGHT)
 
     lines = [
         "/* Generated by tools/generate_mono_icons.py -- do not edit by hand. */",
@@ -253,6 +347,9 @@ def main() -> None:
     emit_icon(lines, "raindrop_small",
               f"raindrop beside forecast precipitation chances ({RAINDROP_SVG.name}, "
               f"{FORECAST_RAINDROP_HEIGHT}px)", *small_drop)
+    emit_icon(lines, "no_wifi",
+              f"no-wifi indicator beside the battery ({NO_WIFI_SVG.name}, "
+              f"{NO_WIFI_HEIGHT}px)", *no_wifi)
     lines.append("#endif /* MONO_ICONS_H */")
     lines.append("")
 
@@ -260,7 +357,8 @@ def main() -> None:
     print(f"Wrote {args.out}: "
           f"thermometer {therm_w}x{therm_h}, raindrop {drop_w}x{drop_h}, "
           f"thermometer_small {small_therm[0]}x{small_therm[1]}, "
-          f"raindrop_small {small_drop[0]}x{small_drop[1]}")
+          f"raindrop_small {small_drop[0]}x{small_drop[1]}, "
+          f"no_wifi {no_wifi[0]}x{no_wifi[1]}")
 
 
 if __name__ == "__main__":

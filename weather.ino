@@ -1470,10 +1470,10 @@ static void sampleBattery()
     Serial.printf("Battery: %d%%, %.2fV\n", batteryPercent, batteryVoltage);
 }
 
-static void drawBattery(int rightEdge, int y)
+static int drawBattery(int rightEdge, int y)
 {
     if (!batteryValid)
-        return;
+        return rightEdge;
 
     char text[16];
     snprintf(text, sizeof(text), "%d%%", batteryPercent);
@@ -1489,6 +1489,14 @@ static void drawBattery(int rightEdge, int y)
         epd_fill_rect(x + 2, y + 2, fillWidth, bodyHeight - 4, 0, framebuffer);
 
     drawText(iconFont, text, x + bodyWidth + 9, y, 1.0f, ALIGN_LEFT, 0);
+    return x;
+}
+
+/* Drawn left of the battery when the last data sync failed. */
+static void drawNoWifi(int rightEdge, int y)
+{
+    drawMonoIcon(no_wifi_icon_data, NO_WIFI_ICON_WIDTH, NO_WIFI_ICON_HEIGHT,
+                 rightEdge - NO_WIFI_ICON_WIDTH, y);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1748,9 +1756,17 @@ static void composeImage()
 {
     memset(framebuffer, 0xFF, FRAMEBUFFER_BYTES);
 
-    /* Battery level in the top-right corner. */
+    /* Battery level in the top-right corner, with a no-wifi indicator to its
+     * left while the last sync failed. */
+    int statusRight = CANVAS_WIDTH - SIDE_MARGIN;
     if (HAS_BATTERY)
-        drawBattery(CANVAS_WIDTH - SIDE_MARGIN, 12);
+    {
+        int batteryLeft = drawBattery(statusRight, 12);
+        if (batteryValid)
+            statusRight = batteryLeft - 8;
+    }
+    if (forecastStale)
+        drawNoWifi(statusRight, 10);
 
     if (forecastCount == 0)
     {
@@ -1777,7 +1793,7 @@ static void composeImage()
      * but using the larger Ubuntu32 font. */
     snprintf(text, sizeof(text), "%.5s", current.time + 11);
     drawIconLabel(currentFont, text, currentX, currentY, currentSize,
-                  0.5f, 0.14f, ALIGN_CENTER, 32);
+                  0.5f, 0.14f, ALIGN_CENTER, 12);
     /* Current temperature, preceded by the thermometer glyph. */
     snprintf(text, sizeof(text), "%d\xB0", (int)ceilf(current.temp));
     drawGlyphLabel(currentFont, text, currentX + (int)(0.06f * currentSize),
