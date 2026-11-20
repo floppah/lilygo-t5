@@ -1316,10 +1316,6 @@ static void drawIconLabel(Font &font, const char *text, int iconX, int iconY,
 
 static const uint8_t *iconData(int code)
 {
-    /* Met Office code 11 is "drizzle"; use the light-rain artwork (12). */
-    if (code == 11)
-        code = 12;
-
     const uint8_t *unknown = nullptr;
     for (int i = 0; i < weather_icon_count; ++i)
     {
