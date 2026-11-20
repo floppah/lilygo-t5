@@ -1373,6 +1373,25 @@ static int fontMidY(const Font &font, int baseline)
     return baseline - (font.ascent - descent) / 2;
 }
 
+/* Draw text with a 1-bit glyph on one side, both centred on `baseline`.  `x` is
+ * the outer edge of the pair: the glyph's left edge when glyphLeft is true,
+ * otherwise its right edge.  This is the layout of the temperature and
+ * precipitation labels in both the current and the forecast blocks. */
+static void drawGlyphLabel(Font &font, const char *text, int x, int baseline,
+                           const uint8_t *glyph, int glyphWidth, int glyphHeight,
+                           bool glyphLeft)
+{
+    ensureFont(font);
+    int glyphX = glyphLeft ? x : x - glyphWidth;
+    int glyphY = fontMidY(font, baseline) - glyphHeight / 2;
+    drawMonoIcon(glyph, glyphWidth, glyphHeight, glyphX, glyphY);
+
+    int textX = glyphLeft ? x + glyphWidth + ICON_LABEL_GAP
+                          : x - glyphWidth - ICON_LABEL_GAP;
+    drawText(font, text, textX, baseline - font.ascent, 1.0f,
+             glyphLeft ? ALIGN_LEFT : ALIGN_RIGHT, 0);
+}
+
 /* Battery level, adapted from the original OWM_EPD47_epaper_v2.5 sketch.
  * GPIO36 (ADC1_CH0) reads the divider on the LilyGo T5 4.7 board.  The
  * eFuse-calibrated Vref is used when available, otherwise the default 1100 mV.
@@ -1723,38 +1742,20 @@ static void composeImage()
     snprintf(text, sizeof(text), "%.5s", current.time + 11);
     drawIconLabel(currentFont, text, currentX, currentY, currentSize,
                   0.5f, 0.14f, ALIGN_CENTER, 32);
-    /* Current temperature, preceded by the thermometer glyph.  The glyph
-     * occupies the old label position and the text moves right by its width
-     * plus a small gap, so the pair still sits in the icon's bottom-left
-     * corner.  The glyph is centred on the digits, whose visual height is
-     * shorter than the font's ascent. */
+    /* Current temperature, preceded by the thermometer glyph. */
     snprintf(text, sizeof(text), "%d\xB0", (int)ceilf(current.temp));
-    ensureFont(dateFont);
-    int thermometerX = currentX + (int)(0.06f * currentSize);
-    int tempBaseline = currentY + (int)(0.80f * currentSize);
-    int tempTop = tempBaseline - dateFont.ascent;
-    int thermometerY = fontMidY(dateFont, tempBaseline) -
-                       THERMOMETER_ICON_HEIGHT / 2;
-    drawMonoIcon(thermometer_icon_data, THERMOMETER_ICON_WIDTH,
-                 THERMOMETER_ICON_HEIGHT, thermometerX, thermometerY);
-    drawText(dateFont, text, thermometerX + THERMOMETER_ICON_WIDTH + ICON_LABEL_GAP,
-             tempTop, 1.0f, ALIGN_LEFT, 0);
+    drawGlyphLabel(currentFont, text, currentX + (int)(0.06f * currentSize),
+                   currentY + (int)(0.80f * currentSize),
+                   thermometer_icon_data, THERMOMETER_ICON_WIDTH,
+                   THERMOMETER_ICON_HEIGHT, true);
     snprintf(text, sizeof(text), "%dkts", (int)lroundf(current.wind * 1.943844f));
     drawIconLabel(currentFont, text, currentX, currentY, currentSize, 0.06f, 0.92f, ALIGN_LEFT);
-    /* Precipitation chance, with the raindrop glyph to its right.  The glyph
-     * occupies the old right margin and the text moves left by its width plus
-     * a small gap to make room for it. */
+    /* Precipitation chance, with the raindrop glyph to its right. */
     snprintf(text, sizeof(text), "%d%%", current.prob);
-    ensureFont(currentFont);
-    int precipRight = currentX + (int)(0.94f * currentSize);
-    int precipBaseline = currentY + (int)(0.80f * currentSize);
-    int precipTop = precipBaseline - currentFont.ascent;
-    int raindropY = fontMidY(currentFont, precipBaseline) -
-                    RAINDROP_ICON_HEIGHT / 2;
-    drawMonoIcon(raindrop_icon_data, RAINDROP_ICON_WIDTH, RAINDROP_ICON_HEIGHT,
-                 precipRight - RAINDROP_ICON_WIDTH, raindropY);
-    drawText(currentFont, text, precipRight - RAINDROP_ICON_WIDTH - ICON_LABEL_GAP,
-             precipTop, 1.0f, ALIGN_RIGHT, 0);
+    drawGlyphLabel(currentFont, text, currentX + (int)(0.94f * currentSize),
+                   currentY + (int)(0.80f * currentSize),
+                   raindrop_icon_data, RAINDROP_ICON_WIDTH,
+                   RAINDROP_ICON_HEIGHT, false);
     snprintf(text, sizeof(text), "%.1fmm", current.precip);
     drawIconLabel(currentFont, text, currentX, currentY, currentSize, 0.94f, 0.90f, ALIGN_RIGHT);
 
@@ -1795,16 +1796,21 @@ static void composeImage()
                       ALIGN_CENTER, 10);
 
         snprintf(text, sizeof(text), "%d\xB0", (int)ceilf(row.temp));
-        drawIconLabel(iconFont, text, x, yPosition, ICON_SIZE, 0.06f, 0.80f,
-                      ALIGN_LEFT);
+        drawGlyphLabel(iconFont, text, x + (int)(0.06f * ICON_SIZE),
+                       yPosition + (int)(0.80f * ICON_SIZE),
+                       thermometer_small_icon_data,
+                       THERMOMETER_SMALL_ICON_WIDTH,
+                       THERMOMETER_SMALL_ICON_HEIGHT, true);
         snprintf(text, sizeof(text), "%dkts", (int)lroundf(row.wind * 1.943844f));
-        drawIconLabel(iconFont, text, x, yPosition, ICON_SIZE, 0.06f, 0.92f,
+        drawIconLabel(iconFont, text, x, yPosition, ICON_SIZE, 0.06f, 0.94f,
                       ALIGN_LEFT);
         snprintf(text, sizeof(text), "%d%%", row.prob);
-        drawIconLabel(iconFont, text, x, yPosition, ICON_SIZE, 0.94f, 0.80f,
-                      ALIGN_RIGHT);
+        drawGlyphLabel(iconFont, text, x + (int)(0.94f * ICON_SIZE),
+                       yPosition + (int)(0.80f * ICON_SIZE),
+                       raindrop_small_icon_data, RAINDROP_SMALL_ICON_WIDTH,
+                       RAINDROP_SMALL_ICON_HEIGHT, false);
         snprintf(text, sizeof(text), "%.1fmm", row.precip);
-        drawIconLabel(iconFont, text, x, yPosition, ICON_SIZE, 0.94f, 0.90f,
+        drawIconLabel(iconFont, text, x, yPosition, ICON_SIZE, 0.94f, 0.92f,
                       ALIGN_RIGHT);
     }
 }
