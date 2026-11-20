@@ -97,6 +97,8 @@ static const char *ICLOUD_ROOT_CA =
 /* Layout: same numbers as the notebook. */
 #define CANVAS_WIDTH EPD_WIDTH
 #define CANVAS_HEIGHT EPD_HEIGHT
+/* 4-bpp framebuffer: one byte covers two pixels. */
+#define FRAMEBUFFER_BYTES ((size_t)(CANVAS_WIDTH / 2) * CANVAS_HEIGHT)
 #define ICON_SIZE WEATHER_ICON_SIZE
 #define SIDE_MARGIN 20
 #define TOP_MARGIN 20
@@ -410,17 +412,10 @@ static bool fetchForecast()
     }
 
     /* The notebook sorts ascending by time before selecting hours. */
-    for (size_t i = 1; i < forecastCount; ++i)
-    {
-        ForecastRow tmp = forecast[i];
-        size_t j = i;
-        while (j > 0 && strcmp(forecast[j - 1].time, tmp.time) > 0)
-        {
-            forecast[j] = forecast[j - 1];
-            --j;
-        }
-        forecast[j] = tmp;
-    }
+    std::sort(forecast, forecast + forecastCount,
+              [](const ForecastRow &a, const ForecastRow &b) {
+                  return strcmp(a.time, b.time) < 0;
+              });
 
     Serial.printf("Parsed %u forecast rows\n", forecastCount);
     return forecastCount > 0;
@@ -690,6 +685,17 @@ static time_t makeCalendarTime(int year, int month, int day,
     return mktime(&timeinfo);
 }
 
+/* "YYYYMMDDTHHMMSS" from a time_t, with an optional iCal 'Z' UTC suffix. */
+static void formatUtcStamp(time_t t, char *out, size_t len, bool withZ)
+{
+    struct tm timeinfo;
+    gmtime_r(&t, &timeinfo);
+    snprintf(out, len, withZ ? "%04d%02d%02dT%02d%02d%02dZ"
+                             : "%04d%02d%02dT%02d%02d%02d",
+             timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+             timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+}
+
 static String icsParam(const String &params, const char *name)
 {
     int p = 0;
@@ -832,12 +838,8 @@ static void addCalendarOccurrence(time_t start, time_t duration,
         calendarEventCount >= MAX_ICAL_EVENTS)
         return;
 
-    struct tm timeinfo;
-    gmtime_r(&start, &timeinfo);
     char stamp[16];
-    snprintf(stamp, sizeof(stamp), "%04d%02d%02dT%02d%02d%02d",
-             timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
-             timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    formatUtcStamp(start, stamp, sizeof(stamp), false);
     if (exdates.indexOf(stamp) >= 0)
         return;
 
@@ -922,19 +924,18 @@ static void addRecurringOccurrences(time_t first, time_t duration,
         p = end + 1;
     }
 
-    struct tm firstLocal;
-    localtime_r(&first, &firstLocal);
-    int firstHour = firstLocal.tm_hour;
-    int firstMinute = firstLocal.tm_min;
-    int firstSecond = firstLocal.tm_sec;
+    struct tm timeinfo;
+    localtime_r(&first, &timeinfo);
+    int firstHour = timeinfo.tm_hour;
+    int firstMinute = timeinfo.tm_min;
+    int firstSecond = timeinfo.tm_sec;
 
-    struct tm startDay;
-    localtime_r(&first, &startDay);
-    startDay.tm_hour = 0;
-    startDay.tm_min = 0;
-    startDay.tm_sec = 0;
-    startDay.tm_isdst = -1;
-    time_t day = mktime(&startDay);
+    /* Same struct rolled back to local midnight: the first candidate day. */
+    timeinfo.tm_hour = 0;
+    timeinfo.tm_min = 0;
+    timeinfo.tm_sec = 0;
+    timeinfo.tm_isdst = -1;
+    time_t day = mktime(&timeinfo);
 
     int emitted = 0;
     for (int dayIndex = 0; day < windowEnd && dayIndex < 365; ++dayIndex,
@@ -1044,17 +1045,10 @@ static void parseCalendarData(const String &ics,
 
 static void sortCalendarEvents()
 {
-    for (size_t i = 1; i < calendarEventCount; ++i)
-    {
-        CalendarEvent item = calendarEvents[i];
-        size_t j = i;
-        while (j > 0 && calendarEvents[j - 1].start > item.start)
-        {
-            calendarEvents[j] = calendarEvents[j - 1];
-            --j;
-        }
-        calendarEvents[j] = item;
-    }
+    std::sort(calendarEvents, calendarEvents + calendarEventCount,
+              [](const CalendarEvent &a, const CalendarEvent &b) {
+                  return a.start < b.start;
+              });
     if (calendarEventCount > CALENDAR_EVENT_COUNT)
         calendarEventCount = CALENDAR_EVENT_COUNT;
 }
@@ -1137,16 +1131,9 @@ static bool fetchCalendarEvents()
     time_t now = time(nullptr);
     time_t windowStart = now;
     time_t windowEnd = now + CALENDAR_WINDOW_DAYS * 86400L;
-    struct tm timeinfo;
-    gmtime_r(&windowStart, &timeinfo);
     char startStamp[17], endStamp[17];   /* "YYYYMMDDTHHMMSSZ" + NUL */
-    snprintf(startStamp, sizeof(startStamp), "%04d%02d%02dT%02d%02d%02dZ",
-             timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
-             timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-    gmtime_r(&windowEnd, &timeinfo);
-    snprintf(endStamp, sizeof(endStamp), "%04d%02d%02dT%02d%02d%02dZ",
-             timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
-             timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    formatUtcStamp(windowStart, startStamp, sizeof(startStamp), true);
+    formatUtcStamp(windowEnd, endStamp, sizeof(endStamp), true);
 
     String reportBody =
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
@@ -1228,14 +1215,20 @@ static bool findGlyph(Font &font, uint16_t code, FontGlyph &glyph)
     return false;
 }
 
+/* Find a glyph, falling back to '?' when the font lacks a character. */
+static bool glyphFor(Font &font, char c, FontGlyph &glyph)
+{
+    return findGlyph(font, (uint8_t)c, glyph) || findGlyph(font, '?', glyph);
+}
+
 static int textWidth(Font &font, const char *text, float f)
 {
     int width = 0;
     for (const char *p = text; *p != '\0'; ++p)
     {
         FontGlyph glyph = {};
-        if (!findGlyph(font, (uint8_t)*p, glyph))
-            findGlyph(font, '?', glyph);
+        if (!glyphFor(font, *p, glyph))
+            continue;
         width += (int)lroundf(glyph.advance * f);
     }
     return width;
@@ -1301,7 +1294,7 @@ static void drawText(Font &font, const char *text, int x, int y, float f,
     for (const char *p = text; *p != '\0'; ++p)
     {
         FontGlyph glyph = {};
-        if (!findGlyph(font, (uint8_t)*p, glyph) && !findGlyph(font, '?', glyph))
+        if (!glyphFor(font, *p, glyph))
             continue;
         drawGlyph(font, glyph, x, y, f, color);
         x += (int)lroundf(glyph.advance * f);
@@ -1323,18 +1316,20 @@ static void drawIconLabel(Font &font, const char *text, int iconX, int iconY,
 
 static const uint8_t *iconData(int code)
 {
+    /* Met Office code 11 is "drizzle"; use the light-rain artwork (12). */
+    if (code == 11)
+        code = 12;
+
+    const uint8_t *unknown = nullptr;
     for (int i = 0; i < weather_icon_count; ++i)
     {
         if (weather_icons[i].code == code)
             return weather_icons[i].data;
+        /* Remember the "unknown" icon (-1) as the fallback. */
+        if (unknown == nullptr && weather_icons[i].code == -1)
+            unknown = weather_icons[i].data;
     }
-    /* Unknown code: fall back to the "unknown" icon (-1) when present. */
-    for (int i = 0; i < weather_icon_count; ++i)
-    {
-        if (weather_icons[i].code == -1)
-            return weather_icons[i].data;
-    }
-    return weather_icons[0].data;
+    return unknown != nullptr ? unknown : weather_icons[0].data;
 }
 
 static void drawIcon(int code, int x, int y, int size)
@@ -1372,6 +1367,14 @@ static void drawMonoIcon(const uint8_t *data, int width, int height, int x, int 
             epd_draw_pixel(px, py, 0, framebuffer);
         }
     }
+}
+
+/* Vertical centre of a run of digits in `font` sitting on `baseline`; used to
+ * line a 1-bit glyph up with the text drawn beside it. */
+static int fontMidY(const Font &font, int baseline)
+{
+    int descent = font.lineHeight - font.ascent;
+    return baseline - (font.ascent - descent) / 2;
 }
 
 /* Battery level, adapted from the original OWM_EPD47_epaper_v2.5 sketch.
@@ -1444,20 +1447,13 @@ static void drawBattery(int rightEdge, int y)
 
 static int dayOfWeek(int year, int month, int day)
 {
-    static const int offset[12] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
-    if (month < 1 || month > 12)
-        return 0;
-    if (month < 3)
-        --year;
-    int dow = (year + year / 4 - year / 100 + year / 400 +
-               offset[month - 1] + day) % 7;
-    return dow < 0 ? dow + 7 : dow;
+    /* daysFromCivil() counts from 1970-01-01, which was a Thursday. */
+    return (int)((daysFromCivil(year, month, day) + 4) % 7);
 }
 
-/* The API supplies timestamps like "YYYY-MM-DDTHH:MMZ".  Validate every field
- * that is later used to index WEEKDAY_NAMES/MONTH_NAMES or dayOfWeek(). */
-static bool parseForecastTime(const char *text, int &year, int &month,
-                              int &day, int &hour, int &minute)
+/* The API supplies timestamps like "YYYY-MM-DDTHH:MMZ".  The whole timestamp
+ * is validated, but only the date fields the canvas uses are returned. */
+static bool parseForecastTime(const char *text, int &year, int &month, int &day)
 {
     int y = 0, m = 0, d = 0, h = 0, min = 0;
     if (sscanf(text, "%4d-%2d-%2dT%2d:%2d", &y, &m, &d, &h, &min) != 5)
@@ -1469,8 +1465,6 @@ static bool parseForecastTime(const char *text, int &year, int &month,
     year = y;
     month = m;
     day = d;
-    hour = h;
-    minute = min;
     return true;
 }
 
@@ -1702,7 +1696,7 @@ static void drawCalendarEvents()
 
 static void composeImage()
 {
-    memset(framebuffer, 0xFF, CANVAS_WIDTH * CANVAS_HEIGHT / 2);
+    memset(framebuffer, 0xFF, FRAMEBUFFER_BYTES);
 
     /* Battery level in the top-right corner. */
     drawBattery(CANVAS_WIDTH - SIDE_MARGIN, 12);
@@ -1743,8 +1737,7 @@ static void composeImage()
     int thermometerX = currentX + (int)(0.06f * currentSize);
     int tempBaseline = currentY + (int)(0.80f * currentSize);
     int tempTop = tempBaseline - dateFont.ascent;
-    int thermometerY = tempBaseline -
-                       (dateFont.ascent - (dateFont.lineHeight - dateFont.ascent)) / 2 -
+    int thermometerY = fontMidY(dateFont, tempBaseline) -
                        THERMOMETER_ICON_HEIGHT / 2;
     drawMonoIcon(thermometer_icon_data, THERMOMETER_ICON_WIDTH,
                  THERMOMETER_ICON_HEIGHT, thermometerX, thermometerY);
@@ -1760,8 +1753,7 @@ static void composeImage()
     int precipRight = currentX + (int)(0.94f * currentSize);
     int precipBaseline = currentY + (int)(0.80f * currentSize);
     int precipTop = precipBaseline - currentFont.ascent;
-    int raindropY = precipBaseline -
-                    (currentFont.ascent - (currentFont.lineHeight - currentFont.ascent)) / 2 -
+    int raindropY = fontMidY(currentFont, precipBaseline) -
                     RAINDROP_ICON_HEIGHT / 2;
     drawMonoIcon(raindrop_icon_data, RAINDROP_ICON_WIDTH, RAINDROP_ICON_HEIGHT,
                  precipRight - RAINDROP_ICON_WIDTH, raindropY);
@@ -1772,8 +1764,8 @@ static void composeImage()
 
     /* Date from the current forecast row, falling back to the system clock if
      * the API supplied a malformed timestamp. */
-    int year = 0, month = 0, day = 0, hour = 0, minute = 0;
-    if (!parseForecastTime(current.time, year, month, day, hour, minute))
+    int year = 0, month = 0, day = 0;
+    if (!parseForecastTime(current.time, year, month, day))
     {
         time_t now = time(nullptr);
         struct tm timeinfo;
@@ -1826,7 +1818,7 @@ static void composeImage()
 static uint64_t framebufferHash()
 {
     uint64_t hash = 14695981039346656037ULL; /* FNV-1a 64-bit offset basis */
-    size_t size = (size_t)(CANVAS_WIDTH / 2) * CANVAS_HEIGHT;
+    size_t size = FRAMEBUFFER_BYTES;
     for (size_t i = 0; i < size; ++i)
     {
         hash ^= framebuffer[i];
@@ -1909,7 +1901,7 @@ void setup()
     delay(100);
 
     epd_init();
-    size_t frameSize = (size_t)(CANVAS_WIDTH / 2) * CANVAS_HEIGHT;
+    size_t frameSize = FRAMEBUFFER_BYTES;
     framebuffer = (uint8_t *)heap_caps_malloc(frameSize, MALLOC_CAP_SPIRAM);
     if (framebuffer == nullptr)
         framebuffer = (uint8_t *)malloc(frameSize);
