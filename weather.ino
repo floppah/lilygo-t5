@@ -4,7 +4,10 @@
  * reads upcoming iCloud CalDAV events, then composes a 960x540 greyscale
  * canvas (current conditions, date, up to three calendar boxes and six
  * hourly icons) in the e-paper framebuffer.  The panel refreshes only when
- * the image has actually changed.
+ * the image has actually changed, and between fetch cycles the CPU
+ * light-sleeps on the RTC timer: RAM and PSRAM (including the framebuffer
+ * and display hash) survive, the system clock is adjusted on wake, and the
+ * idle draw drops from tens of milliamps to a few.
  *
  * This is the ESP32 translation of ../weather.ipynb.  The icons come from
  * ../icons and are embedded as 4-bit greyscale data in weather_icons.h
@@ -25,6 +28,7 @@
 #include <stdlib.h>
 #include <esp_heap_caps.h>
 #include <esp_adc_cal.h>
+#include <esp_sleep.h>
 #include <string.h>
 #include <time.h>
 
@@ -120,7 +124,9 @@ static const char *ICLOUD_ROOT_CA =
 #define CALENDAR_NOTES_LEN 160
 #define LOOP_INTERVAL_MS (5UL * 60UL * 1000UL)
 /* Data is fetched on the wall clock at :01 and :31.  While the clock is still
- * unset (before the first NTP sync) retries use this interval instead. */
+ * unset (before the first NTP sync) retries use this interval instead,
+ * measured in LOOP_INTERVAL_MS light-sleep chunks: millis() does not advance
+ * while the CPU sleeps, so completed chunks are counted on wake. */
 #define DATA_REFRESH_FALLBACK_MS (30UL * 60UL * 1000UL)
 #define REFRESH_MINUTE_EARLY 1
 #define REFRESH_MINUTE_LATE 31
@@ -131,9 +137,10 @@ static const char *ICLOUD_ROOT_CA =
 #define HAS_BATTERY true
 #endif
 
-/* Battery sampling: five ADC reads half a second apart, averaged. */
-#define BATTERY_SAMPLE_COUNT 5
-#define BATTERY_SAMPLE_INTERVAL_MS 500
+/* Battery sampling: three ADC reads 50 ms apart, averaged.  A short spacing
+ * settles the ADC just as well as a long one and keeps the awake time down. */
+#define BATTERY_SAMPLE_COUNT 3
+#define BATTERY_SAMPLE_INTERVAL_MS 50
 
 /* Hard caps for HTTP response bodies.  HTTPClient::getString() buffers the
  * whole payload with no limit, so without these a large or hostile response
@@ -207,11 +214,20 @@ static Font iconFont = { ICON_FONT_BITS, 0, 0, 0, false };
 static Font currentFont = { CURRENT_FONT_BITS, 0, 0, 0, false };
 static Font calendarFont = { CALENDAR_FONT_BITS, 0, 0, 0, false };
 
-static unsigned long lastDataRefreshMs = 0;
+/* Completed LOOP_INTERVAL_MS light-sleep chunks since the last fetch attempt,
+ * counted only while the wall clock is unset (see DATA_REFRESH_FALLBACK_MS).
+ * millis() does not advance during light sleep, so chunks are counted on wake
+ * instead of using a millis()-based interval. */
+static uint32_t fallbackWakeups = 0;
 static time_t lastFetchTime = 0;
 static bool dataRefreshDue = true;
 static uint64_t lastDisplayedHash = 0;
 static bool displayInitialized = false;
+/* Set when the composed image may have changed and so needs (re)drawing. */
+static bool composeNeeded = true;
+/* True while the forecast on display is stale (the last fetch failed): a
+ * LOOP_INTERVAL_MS heartbeat keeps the current hour rolling forward. */
+static bool forecastStale = true;
 static int batteryPercent = 0;
 static float batteryVoltage = 0.0f;
 static bool batteryValid = false;
@@ -1410,8 +1426,8 @@ static void drawGlyphLabel(Font &font, const char *text, int x, int baseline,
  * composing the image let ADC noise change the drawn percentage every loop,
  * which made the framebuffer hash differ and forced a full refresh every five
  * minutes even when the forecast and calendar were unchanged.  Each refresh
- * averages BATTERY_SAMPLE_COUNT reads half a second apart and the resulting
- * level is rounded to the nearest 5%. */
+ * averages BATTERY_SAMPLE_COUNT reads BATTERY_SAMPLE_INTERVAL_MS apart and
+ * the resulting level is rounded to the nearest 5%. */
 static void sampleBattery()
 {
     static uint32_t vref = 1100;
@@ -1880,7 +1896,7 @@ static bool refreshDue()
     if (dataRefreshDue)
         return true;
     if (!timeIsValid())
-        return millis() - lastDataRefreshMs >= DATA_REFRESH_FALLBACK_MS;
+        return fallbackWakeups * LOOP_INTERVAL_MS >= DATA_REFRESH_FALLBACK_MS;
 
     time_t now = time(nullptr);
     time_t slot = refreshSlotStart(now);
@@ -1890,16 +1906,12 @@ static bool refreshDue()
 }
 
 /* Milliseconds until the next fetch slot (:01 or :31 local time); 0 when one
- * is due now.  Falls back to a fixed interval while the clock is unset. */
+ * is due now.  While the clock is unset the wait is a single
+ * LOOP_INTERVAL_MS chunk: the retry interval is counted in chunks on wake. */
 static uint32_t msUntilNextRefresh()
 {
     if (!timeIsValid())
-    {
-        unsigned long elapsed = millis() - lastDataRefreshMs;
-        return elapsed >= DATA_REFRESH_FALLBACK_MS
-                   ? 0
-                   : (uint32_t)(DATA_REFRESH_FALLBACK_MS - elapsed);
-    }
+        return LOOP_INTERVAL_MS;
 
     time_t now = time(nullptr);
     struct tm timeinfo;
@@ -1911,6 +1923,17 @@ static uint32_t msUntilNextRefresh()
                                                : 60 + REFRESH_MINUTE_EARLY;
     int seconds = target * 60 - (minute * 60 + timeinfo.tm_sec);
     return seconds > 0 ? (uint32_t)seconds * 1000UL : 0;
+}
+
+/* Light sleep for `ms` on the RTC timer.  RAM and PSRAM contents survive and
+ * the system clock is adjusted for the slept time on wake, but millis() does
+ * not advance.  The UART is drained first: sleeping with bytes still in the
+ * TX FIFO garbles the serial console. */
+static void lightSleepMs(uint32_t ms)
+{
+    Serial.flush();
+    esp_sleep_enable_timer_wakeup((uint64_t)ms * 1000ULL);
+    esp_light_sleep_start();
 }
 
 /* ------------------------------------------------------------------ */
@@ -1942,6 +1965,7 @@ void loop()
      * past the hour.  WiFi is only powered up for the duration of that cycle. */
     if (refreshDue())
     {
+        setCpuFrequencyMhz(240);        /* WiFi wants the full clock */
         bool updated = false;
         bool calendarUpdated = false;
         if (connectToWiFi())
@@ -1951,11 +1975,15 @@ void loop()
             calendarUpdated = fetchCalendarEvents();
             disconnectWiFi();
         }
+        /* The CPU-bound compose/hash below runs at the low-power clock. */
+        setCpuFrequencyMhz(80);
         if (HAS_BATTERY)
             sampleBattery();
-        lastDataRefreshMs = millis();
         lastFetchTime = time(nullptr);
         dataRefreshDue = false;
+        fallbackWakeups = 0;
+        forecastStale = !updated;
+        composeNeeded = true;
         Serial.println(updated ? "Forecast updated"
                                : "Keeping previous forecast");
         Serial.println(calendarUpdated ? "Calendar updated"
@@ -1963,25 +1991,37 @@ void loop()
     }
 
     /* Compose into the framebuffer and only drive the e-paper when the image
-     * has changed since the last refresh. */
-    composeImage();
-    uint64_t hash = framebufferHash();
-    if (!displayInitialized || hash != lastDisplayedHash)
+     * may have changed: after a fetch, or (forced below) on the stale-data
+     * heartbeat where crossing an hour boundary advances the displayed row. */
+    if (forecastStale)
+        composeNeeded = true;
+    if (composeNeeded)
     {
-        refreshDisplay();
-        lastDisplayedHash = hash;
-        displayInitialized = true;
-        Serial.println("Display updated");
-    }
-    else
-    {
-        Serial.println("Display unchanged, skipping refresh");
+        composeImage();
+        uint64_t hash = framebufferHash();
+        if (!displayInitialized || hash != lastDisplayedHash)
+        {
+            refreshDisplay();
+            lastDisplayedHash = hash;
+            displayInitialized = true;
+            Serial.println("Display updated");
+        }
+        else
+        {
+            Serial.println("Display unchanged, skipping refresh");
+        }
+        composeNeeded = false;
     }
 
-    /* Sleep up to the next slot, keeping the existing five minute heartbeat so
-     * the image hash still gets rechecked now and then. */
+    /* Light-sleep to the next fetch slot.  With fresh data that is straight
+     * through to :01 or :31 (up to ~30 minutes); stale data keeps the old
+     * five-minute heartbeat so the current hour still rolls forward. */
     uint32_t wait = msUntilNextRefresh();
     if (wait == 0)
-        wait = 1000;                     /* slot just served; recheck shortly */
-    delay(wait < LOOP_INTERVAL_MS ? wait : LOOP_INTERVAL_MS);
+        wait = 1000;                   /* never sleep a zero-length interval */
+    if (forecastStale && wait > LOOP_INTERVAL_MS)
+        wait = LOOP_INTERVAL_MS;
+    lightSleepMs(wait);
+    if (!timeIsValid())
+        ++fallbackWakeups;             /* one completed chunk, clock unset */
 }
