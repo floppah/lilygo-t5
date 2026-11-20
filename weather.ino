@@ -125,6 +125,16 @@ static const char *ICLOUD_ROOT_CA =
 #define REFRESH_MINUTE_EARLY 1
 #define REFRESH_MINUTE_LATE 31
 
+/* Set to false (e.g. with -D HAS_BATTERY=false) on boards without the battery
+ * divider: the indicator is left off the canvas and the ADC is not read. */
+#ifndef HAS_BATTERY
+#define HAS_BATTERY true
+#endif
+
+/* Battery sampling: five ADC reads half a second apart, averaged. */
+#define BATTERY_SAMPLE_COUNT 5
+#define BATTERY_SAMPLE_INTERVAL_MS 500
+
 /* Hard caps for HTTP response bodies.  HTTPClient::getString() buffers the
  * whole payload with no limit, so without these a large or hostile response
  * could exhaust the heap. */
@@ -1399,7 +1409,9 @@ static void drawGlyphLabel(Font &font, const char *text, int x, int baseline,
  * The ADC is sampled once per data refresh and cached.  Sampling it while
  * composing the image let ADC noise change the drawn percentage every loop,
  * which made the framebuffer hash differ and forced a full refresh every five
- * minutes even when the forecast and calendar were unchanged. */
+ * minutes even when the forecast and calendar were unchanged.  Each refresh
+ * averages BATTERY_SAMPLE_COUNT reads half a second apart and the resulting
+ * level is rounded to the nearest 5%. */
 static void sampleBattery()
 {
     static uint32_t vref = 1100;
@@ -1410,7 +1422,14 @@ static void sampleBattery()
     if (calType == ESP_ADC_CAL_VAL_EFUSE_VREF)
         vref = adcChars.vref;
 
-    float voltage = analogRead(36) / 4096.0f * 6.566f * (vref / 1000.0f);
+    float voltageSum = 0.0f;
+    for (int i = 0; i < BATTERY_SAMPLE_COUNT; ++i)
+    {
+        if (i > 0)
+            delay(BATTERY_SAMPLE_INTERVAL_MS);
+        voltageSum += analogRead(36) / 4096.0f * 6.566f * (vref / 1000.0f);
+    }
+    float voltage = voltageSum / BATTERY_SAMPLE_COUNT;
     if (voltage <= 1.0f)
     {
         /* No valid reading (e.g. running on USB only). */
@@ -1714,7 +1733,8 @@ static void composeImage()
     memset(framebuffer, 0xFF, FRAMEBUFFER_BYTES);
 
     /* Battery level in the top-right corner. */
-    drawBattery(CANVAS_WIDTH - SIDE_MARGIN, 12);
+    if (HAS_BATTERY)
+        drawBattery(CANVAS_WIDTH - SIDE_MARGIN, 12);
 
     if (forecastCount == 0)
     {
@@ -1931,7 +1951,8 @@ void loop()
             calendarUpdated = fetchCalendarEvents();
             disconnectWiFi();
         }
-        sampleBattery();
+        if (HAS_BATTERY)
+            sampleBattery();
         lastDataRefreshMs = millis();
         lastFetchTime = time(nullptr);
         dataRefreshDue = false;
